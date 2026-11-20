@@ -65,6 +65,13 @@ class Term:
         os.write(self.fd, text.encode())
         self.pump(settle)
 
+    def wait(self, test, limit):
+        """Pump until test(screen text) holds or limit seconds pass; slow machines get time."""
+        end = time.time() + limit
+        while time.time() < end and not test(self.text()):
+            self.pump(0.05)
+        return self.text()
+
     def text(self):
         return "\n".join(line.rstrip() for line in self.screen.display).rstrip()
 
@@ -88,9 +95,10 @@ def scenario(shell, answer, status):
                "STUB_ANSWER": answer, "STUB_STATUS": str(status), "STUB_DELAY": "1"}
         term = Term(shell, env)
         term.type("list files by size")
-        term.type("\x07", 0.5)
-        during = term.text()
-        term.pump(1.5)
+        term.type("\x07", 0.1)
+        during = term.wait(lambda t: "sol: thinking 0." in t, 5)
+        after = term.wait(lambda t: "thinking" not in t, 10)
+        term.pump(0.3)
         after = term.text()
         term.type(" Z", 0.3)
         typed = term.text()

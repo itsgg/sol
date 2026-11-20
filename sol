@@ -278,9 +278,13 @@ EOF
 # `| sol: thinking 1.2s`. Only when the widget asks (SOL_FEEDBACK=1) and a terminal is there;
 # the shell redraws its line when the widget returns. Writes to fd 3, the terminal.
 sol_spinner() {
-    local frames="|/-\\" i=0 start=${EPOCHREALTIME/./} now ms
+    local frames="|/-\\" i=0 start now ms
+    # EPOCHREALTIME is bash 5; on bash 4 the time counts in whole seconds.
+    start=${EPOCHREALTIME/./}
+    start=${start:-$((SECONDS * 1000000))}
     while :; do
         now=${EPOCHREALTIME/./}
+        now=${now:-$((SECONDS * 1000000))}
         ms=$(((now - start) / 1000))
         printf '\r\e[2K\e[2m%s sol: thinking %d.%ds\e[0m' "${frames:i++%4:1}" $((ms / 1000)) $((ms % 1000 / 100)) >&3
         sleep 0.1
@@ -306,7 +310,8 @@ sol_ask() {
         exec 3>&-
     fi
     if ((status)); then
-        [[ -n $answer ]] && printf '%s\n' "$answer" >&2
+        # 127 is a missing vazhi, which main reports in its own words.
+        ((status != 127)) && [[ -n $answer ]] && printf '%s\n' "$answer" >&2
         return "$status"
     fi
     printf '%s' "$answer"

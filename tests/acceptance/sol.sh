@@ -82,10 +82,18 @@ else
 fi
 out=$(SOL_VAZHI=$work/missing "$sol" -- list files 2>"$work/err")
 status=$?
-if [[ $status -eq 1 && -z $out ]] && grep -q "vazhi not found" "$work/err"; then
-    pass "REQ-CMD-03 missing vazhi exits 1 and says so"
+if [[ $status -eq 1 && -z $out && $(wc -l <"$work/err") -eq 1 ]] && grep -q "vazhi not found" "$work/err"; then
+    pass "REQ-CMD-03 missing vazhi exits 1 and says so, once"
 else
     fail "REQ-CMD-03 missing: status=$status out=[$out] err=[$(cat "$work/err")]"
+fi
+
+# REQ-WIDGET-06: the spinner's time advances on bash 4, which has no EPOCHREALTIME.
+spin=$(bash -c 'unset EPOCHREALTIME; source <(sed "s/^main \"\$@\"\$//" "$1"); sol_spinner 3>&1 & sleep 2.2; kill $!' _ "$sol" 2>&1)
+if [[ $spin == *"sol: thinking 0.0s"* && ( $spin == *"sol: thinking 1.0s"* || $spin == *"sol: thinking 2.0s"* ) ]]; then
+    pass "REQ-WIDGET-06 spinner without EPOCHREALTIME"
+else
+    fail "REQ-WIDGET-06 spinner without EPOCHREALTIME: $spin"
 fi
 
 # REQ-CMD-04: an answer with no command line exits 3 with nothing on stdout.
