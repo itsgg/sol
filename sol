@@ -101,23 +101,25 @@ sol_history() {
 sol_alias_names() {
     local line
     while IFS= read -r line; do
-        [[ $line =~ ^alias\ ([A-Za-z0-9_.+-]+)= ]] || continue
+        # Names with only letters, digits, _ and -, so a name is safe inside a regex.
+        [[ $line =~ ^alias\ ([A-Za-z0-9_-]+)= ]] || continue
         type -P -- "${BASH_REMATCH[1]}" >/dev/null 2>&1 && printf '%s\n' "${BASH_REMATCH[1]}"
     done <<<"${SOL_ALIASES:-}"
 }
 
 # Models write the original program's flags, so a command word an alias replaces is run as
-# `command <name>`: at the start and after |, ;, &, ( or `. Quoted text is not parsed.
+# `command <name>`: at the start and after |, ;, &, ( or `, up to a space, an operator, a
+# redirect, ) or ` or the end. Quoted text is not parsed.
 sol_unalias() {
     local cmd=$1 name re
     while IFS= read -r name; do
         [[ -n $name ]] || continue
-        re="(^|[|;&(\`][[:space:]]*)${name//./\\.}([[:space:]]|$)"
+        re="(^|[|;&(\`][[:space:]]*)$name([[:space:]|;&)\`<>].*|$)"
         local out="" rest=$cmd
+        # Each match leaves the character after the name in rest, so `ls; ls` matches twice.
         while [[ $rest =~ $re ]]; do
-            local before=${rest%%"${BASH_REMATCH[0]}"*}
-            out+="$before${BASH_REMATCH[1]}command $name${BASH_REMATCH[2]}"
-            rest=${rest#*"${BASH_REMATCH[0]}"}
+            out+="${rest:0:${#rest}-${#BASH_REMATCH[0]}}${BASH_REMATCH[1]}command $name"
+            rest=${BASH_REMATCH[2]}
         done
         cmd=$out$rest
     done < <(sol_alias_names)
@@ -130,7 +132,9 @@ sol_dirs() {
     for d in "$cwd"/*/; do
         [[ -d $d ]] || continue
         d=${d%/}
-        names+=("${d##*/}")
+        d=${d##*/}
+        [[ $d == *[[:space:]]* ]] && d="'$d'"
+        names+=("$d")
         ((${#names[@]} >= 40)) && break
     done
     local IFS=" "

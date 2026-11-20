@@ -6,3 +6,8 @@ command ls -lt	command ls -lt
 lsblk -f	lsblk -f
 echo ls	echo ls
 g status	g status
+ls|wc -l	command ls|wc -l
+(ls)	(command ls)
+ls; ls -a	command ls; command ls -a
+ls>out.txt	command ls>out.txt
+echo `ls`	echo `command ls`

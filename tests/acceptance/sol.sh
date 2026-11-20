@@ -131,7 +131,7 @@ done <"$root/spec/cases/secret/keep.txt"
 
 # REQ-CMD-05: a command word that an alias replaces runs as `command <name>`; other words,
 # shortcuts (g) and quoted uses stay. Aliases: ls replaces a command, g does not.
-aliases=$'alias ls=\'eza -lh --token-ABC123\'\nalias g=\'git\''
+aliases=$'alias ls=\'eza -lh --token-ABC123\'\nalias g=\'git\'\nalias c++=\'clang++\''
 while IFS=$'\t' read -r input want; do
     got=$(STUB_ANSWER=$input SOL_ALIASES=$aliases "$sol" -- x)
     if [[ $got == "$want" ]]; then pass "REQ-CMD-05 [$input]"; else fail "REQ-CMD-05 [$input]: got [$got] want [$want]"; fi
@@ -146,10 +146,10 @@ else
 fi
 
 # REQ-CTX-03: the directories in the current directory, not hidden ones or files, are named.
-mkdir -p "$work/here/Downloads" "$work/here/src" "$work/here/.cache"
+mkdir -p "$work/here/Downloads" "$work/here/src" "$work/here/.cache" "$work/here/My Files"
 : >"$work/here/notes.txt"
 prompt=$(SOL_CWD=$work/here "$sol" --dry-run x)
-if [[ $prompt == *$'\nDirectories here: Downloads src\n'* ]]; then
+if [[ $prompt == *$'\nDirectories here: Downloads \'My Files\' src\n'* ]]; then
     pass "REQ-CTX-03 directory names"
 else
     fail "REQ-CTX-03 got: $prompt"
