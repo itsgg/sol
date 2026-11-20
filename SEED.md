@@ -64,7 +64,7 @@ First release: bash only, the Ctrl+G widget, `sol` printing one command, context
 
 Deferred: a fish widget, multi-line scripts, explanations, a confirmation step for dangerous commands, offline fallback.
 
-Reference cases: `spec/cases/clean/` holds model outputs and the command line Sol must make of each (written by hand from the formats seen on 2026-11-20: fences, `$ ` prompts, comments, several lines). `spec/cases/requests.txt` holds reference requests for the live, ungated check.
+Reference cases: `spec/cases/clean/` holds model outputs and the command line Sol must make of each (written by hand from the formats seen on 2026-11-20: fences, `$ ` prompts, comments, several lines). `spec/cases/live.tsv` holds reference requests with a pattern for a correct command, for the live, ungated check in `tests/live/eval.py`.
 
 ## 10. Principles and tradeoffs
 

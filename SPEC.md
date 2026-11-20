@@ -142,11 +142,11 @@ Covered by REQ-CMD-02, REQ-CMD-03, REQ-CMD-04 and REQ-WIDGET-03. Ctrl+C while wa
 When vazhi answers at once, `sol -- REQUEST` with five history lines shall take under 100 ms, median of 11 runs.
 Acceptance: `tests/acceptance/sol.sh` (REQ-PERF-01). Measured 24 ms on GG's laptop, 2026-11-20. Provisional for slower machines.
 
-End-to-end time depends on vazhi's fast list: 0.5 to 0.7 s measured 2026-11-20 (SEED R2). It is checked by eye with `spec/cases/requests.txt`, not gated, since free models change nightly.
+End-to-end time depends on vazhi's fast list: 0.5 to 0.7 s measured 2026-11-20 (SEED R2). It is measured with `tests/live/eval.py`, not gated, since free models change nightly: 33/33 on 2026-11-20, three runs of eleven requests, slowest answer 1.4 s.
 
 ## 10. Verification and the gate
 
-Tests of record are `tests/acceptance/sol.sh` (the command, cleaning, context, performance) and `tests/acceptance/widget.py` (the widget in a real bash on a pty). Both use a stub vazhi and make no network calls. Conformance data lives in `spec/cases/clean/` and `spec/cases/secret/`. Task acceptance runs them with shellcheck; the full gate re-runs every task in review or done. The live check is `spec/cases/requests.txt` through the real vazhi, read by GG.
+Tests of record are `tests/acceptance/sol.sh` (the command, cleaning, context, performance) and `tests/acceptance/widget.py` (the widgets in a real bash and zsh on a pty). Both use a stub vazhi and make no network calls. Conformance data lives in `spec/cases/clean/` and `spec/cases/secret/`. Task acceptance runs them with shellcheck; the full gate re-runs every task in review or done. The live check is `tests/live/eval.py`: the requests in `spec/cases/live.tsv` through the real vazhi, each scored by a regex for a correct command, run before a change to the prompt or to vazhi's fast list. It never gates, and its score is recorded in the task's log.
 
 ## 11. Protected checks
 
@@ -161,6 +161,7 @@ Beyond `tools/protected.txt` (which covers `tests/acceptance/**` and `spec/cases
 - 2026-11-20: created.
 - 2026-11-20: change 0001 merged: REQ-CLEAN-01 keeps backticks inside a line.
 - 2026-11-20: change 0002 merged: REQ-CMD-05 and REQ-CTX-03 added, REQ-WIDGET-02 sends aliases.
+- 2026-11-20: the live check became tests/live/eval.py over spec/cases/live.tsv, scored; no requirement changed.
 - 2026-11-20: change 0003 merged: REQ-WIDGET-05 (zsh) and REQ-CMD-06 (bash 4) added, REQ-CMD-02 takes zsh.
 
 ### Retired

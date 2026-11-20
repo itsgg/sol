@@ -1,0 +1,13 @@
+# Live reference requests: request, then a regex a correct command matches, then optionally one it must not.
+# Read by tests/live/eval.py; never gated. The setting: a directory holding Downloads and src, ls aliased to eza.
+List all hidden files	-name ['"]?\.\*|ls -d \.|\.\[!\.\]	^(command )?ls -l?a\.?$
+List all .bak files	find .*\.bak
+Which is the oldest file in this dir	maxdepth 1.*sort|ls -\w*(tr|rt)\w*.*head -(n )?1|ls -(?!\w*r)\w*t\w*.*tail -(n )?1
+find all pdfs over 10mb in downloads modified this week	find .*Downloads.*-size \+10M.*-mtime -7
+undo my last git commit but keep the changes	git reset --soft HEAD(~1?|\^)
+show which process listens on port 8080	(ss|lsof|netstat|fuser).*8080
+show disk usage of each folder here, biggest first	du .*\| *sort .*-\w*r
+tar the logs folder into logs.tar.gz	tar .*logs\.tar\.gz .*logs
+replace foo with bar in every .ts file under src	src.*\.ts.*sed .*s/foo/bar|sed .*s/foo/bar.*src
+create a new branch called fix-login and switch to it	git (switch -c|checkout -b) fix-login
+git log --onelin -5	git log --oneline -(n )?5

@@ -3,7 +3,7 @@
 # never runs it (SEED P1). SPEC.md section 7 fixes every interface below.
 set -o pipefail
 
-SOL_VERSION=0.1.0
+SOL_VERSION=0.2.0
 HISTORY_LINES=5
 
 usage() {
