@@ -145,6 +145,9 @@ while IFS=$'\t' read -r input want; do
     got=$(STUB_ANSWER=$input SOL_ALIASES=$aliases "$sol" -- x)
     if [[ $got == "$want" ]]; then pass "REQ-CMD-05 [$input]"; else fail "REQ-CMD-05 [$input]: got [$got] want [$want]"; fi
 done <"$root/spec/cases/unalias/cases.tsv"
+# zsh prints aliases as name=value, with quotes only when needed.
+got=$(STUB_ANSWER='ls -lt | tail -1' SOL_ALIASES=$'g=git\nls=\'eza -lh\'\nrun-help=man' "$sol" -- x)
+if [[ $got == "command ls -lt | tail -1" ]]; then pass "REQ-CMD-05 zsh alias format"; else fail "REQ-CMD-05 zsh alias format: got [$got]"; fi
 rm -f "$work/args"
 STUB_ANSWER=ls SOL_ALIASES=$aliases "$sol" -- x >/dev/null
 stub_args
