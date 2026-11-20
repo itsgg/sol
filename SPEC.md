@@ -28,7 +28,7 @@ Two parts, in one bash script, `sol`:
 - The command `sol`: builds the context, calls `vazhi ask --fast`, cleans the answer, prints the command.
 - The widget: bash code that `sol --init bash` prints and `~/.bashrc` evaluates. It reads the line and history, calls `sol` by the absolute path it was printed from, and writes the line back.
 
-Dependencies: bash 4 or later to run `sol`, bash 5 for its widget (READLINE_LINE and READLINE_POINT for `bind -x`, SEED R6), zsh 5 for the zsh widget (ZLE's BUFFER and CURSOR), coreutils' `readlink`, and `vazhi` 0.2 or later (`vazhi ask --fast --system TEXT -- PROMPT`, SEED R3). Tests also need python 3 for the pty test, zsh, and shellcheck; CI installs zsh in `tools/ci-setup.local.sh`. Nothing else.
+Dependencies: bash 4 or later to run `sol`, bash 5 for its widget (READLINE_LINE and READLINE_POINT for `bind -x`, SEED R6), zsh 5 for the zsh widget (ZLE's BUFFER and CURSOR), coreutils' `readlink`, and `vazhi` 0.2 or later (`vazhi ask --fast --system TEXT -- PROMPT`, SEED R3). Tests also need python 3 for the pty tests, zsh, shellcheck, and uv to run the screen test with pyte 0.8.2; CI installs zsh and uv in `tools/ci-setup.local.sh`. Nothing else.
 
 ## 5. Data model and invariants
 
@@ -110,6 +110,10 @@ Acceptance: `tests/acceptance/widget.py` (REQ-WIDGET-02) in an interactive bash 
 While zsh's line editor is active, when Ctrl+G is pressed on a non-blank line, the widget that `sol --init zsh` prints shall call `sol` with the line, `alias` output, `fc -ln -5` output, `$PWD` and the zsh version, and on exit 0 set BUFFER to the command and CURSOR to its end, running nothing; on failure it shall leave BUFFER as it was and redraw the prompt. REQ-WIDGET-03 and REQ-WIDGET-04 hold for it as for bash.
 Acceptance: `tests/acceptance/widget.py` (REQ-WIDGET-05) runs the widget cases in an interactive zsh on a pty as well as in bash.
 
+### REQ-WIDGET-06: Feedback while sol waits
+While a widget waits for `sol`, the system shall show `<frame> sol: thinking <s>.<tenths>s` on the line, dim, with a frame from `|/-\` and the elapsed time updated every 0.1 s, and shall clear it before the line is redrawn; on failure the reason stays on screen (above the prompt in bash, below it in zsh) and the request stays on the line. `sol` draws it only when SOL_FEEDBACK is 1 and /dev/tty opens, so scripts calling `sol` see nothing.
+Acceptance: `tests/acceptance/screen.py` (REQ-WIDGET-06) in bash and zsh on a pty behind a 60x10 pyte terminal, with a stub vazhi that answers after a second: the spinner shows while waiting, the screen afterwards holds only the command, and on failure the reason and the request.
+
 ### REQ-WIDGET-03: Failure keeps the line
 If `sol` exits non-zero or prints nothing, then the widget shall leave READLINE_LINE and READLINE_POINT as they were.
 Acceptance: `tests/acceptance/widget.py` (REQ-WIDGET-03).
@@ -128,7 +132,7 @@ sol --init bash|zsh        print the widget
 sol --help | --version
 ```
 
-Environment: SOL_HISTORY, SOL_CWD, SOL_SHELL (section 5), SOL_ALIASES (`alias` output; only names are used), SOL_VAZHI (the vazhi command), SOL_OS_RELEASE (the os-release file; for tests).
+Environment: SOL_HISTORY, SOL_CWD, SOL_SHELL (section 5), SOL_ALIASES (`alias` output; only names are used), SOL_FEEDBACK (1: draw the spinner on /dev/tty), SOL_VAZHI (the vazhi command), SOL_OS_RELEASE (the os-release file; for tests).
 
 Exit status: 0 printed a command; 1 no answer; 2 bad usage; 3 the answer held no command. Stdout carries only the command; every message goes to stderr, one line, starting `sol:`.
 
@@ -146,7 +150,7 @@ End-to-end time depends on vazhi's fast list: 0.5 to 0.7 s measured 2026-11-20 (
 
 ## 10. Verification and the gate
 
-Tests of record are `tests/acceptance/sol.sh` (the command, cleaning, context, performance) and `tests/acceptance/widget.py` (the widgets in a real bash and zsh on a pty). Both use a stub vazhi and make no network calls. Conformance data lives in `spec/cases/clean/` and `spec/cases/secret/`. Task acceptance runs them with shellcheck; the full gate re-runs every task in review or done. The live check is `tests/live/eval.py`: the requests in `spec/cases/live.tsv` through the real vazhi, each scored by a regex for a correct command, run before a change to the prompt or to vazhi's fast list. It never gates, and its score is recorded in the task's log.
+Tests of record are `tests/acceptance/sol.sh` (the command, cleaning, context, performance), `tests/acceptance/widget.py` (the widgets in a real bash and zsh on a pty) and `tests/acceptance/screen.py` (what the widgets show, through a pyte terminal). Both use a stub vazhi and make no network calls. Conformance data lives in `spec/cases/clean/` and `spec/cases/secret/`. Task acceptance runs them with shellcheck; the full gate re-runs every task in review or done. The live check is `tests/live/eval.py`: the requests in `spec/cases/live.tsv` through the real vazhi, each scored by a regex for a correct command, run before a change to the prompt or to vazhi's fast list. It never gates, and its score is recorded in the task's log.
 
 ## 11. Protected checks
 
@@ -161,6 +165,7 @@ Beyond `tools/protected.txt` (which covers `tests/acceptance/**` and `spec/cases
 - 2026-11-20: created.
 - 2026-11-20: change 0001 merged: REQ-CLEAN-01 keeps backticks inside a line.
 - 2026-11-20: change 0002 merged: REQ-CMD-05 and REQ-CTX-03 added, REQ-WIDGET-02 sends aliases.
+- 2026-11-20: change 0004 merged: REQ-WIDGET-06 added, feedback while sol waits.
 - 2026-11-20: the live check became tests/live/eval.py over spec/cases/live.tsv, scored; no requirement changed.
 - 2026-11-20: change 0003 merged: REQ-WIDGET-05 (zsh) and REQ-CMD-06 (bash 4) added, REQ-CMD-02 takes zsh.
 

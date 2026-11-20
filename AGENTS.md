@@ -35,6 +35,6 @@ Plain words to a shell command on Ctrl+G, through vazhi's free models. Read SEED
 
 ## Project
 
-- `tests/acceptance/sol.sh` and `python3 -I tests/acceptance/widget.py`: the tests of record, with a stub vazhi and no network; `shellcheck sol tests/acceptance/sol.sh` lints. Task 0001's acceptance runs all three, so the full gate does.
+- `tests/acceptance/sol.sh`, `python3 -I tests/acceptance/widget.py` and `uv run --no-project --with pyte==0.8.2 python tests/acceptance/screen.py`: the tests of record, with a stub vazhi and no network; `shellcheck sol tests/acceptance/sol.sh` lints. The tasks' acceptance runs them, so the full gate does.
 - `./sol --dry-run REQUEST` shows the prompt without calling vazhi. `tests/live/eval.py` scores live answers through the real vazhi (network, keys, about a minute); run it before changing the prompt, never in the gate.
 - `sol` never runs the command it makes, and never calls a model provider itself: models are vazhi's (SEED P1, P4).

@@ -231,8 +231,11 @@ __sol_widget() {
     local request=\$READLINE_LINE command
     [[ -n \${request//[[:space:]]/} ]] || return 0
     # history, not fc: inside bind -x, fc -l leaves out the latest command.
-    command=\$(SOL_ALIASES="\$(alias)" SOL_HISTORY="\$(HISTTIMEFORMAT= history $HISTORY_LINES)" SOL_CWD="\$PWD" SOL_SHELL="bash \${BASH_VERSION%%[^0-9.]*}" $self -- "\$request") || return 0
-    [[ -n \$command ]] || return 0
+    # SOL_FEEDBACK: sol draws a spinner on this line while it waits; bash redraws the line after.
+    # Its stderr is kept apart, so a failure's reason prints on its own line above the prompt.
+    if ! command=\$(SOL_FEEDBACK=1 SOL_ALIASES="\$(alias)" SOL_HISTORY="\$(HISTTIMEFORMAT= history $HISTORY_LINES)" SOL_CWD="\$PWD" SOL_SHELL="bash \${BASH_VERSION%%[^0-9.]*}" $self -- "\$request") || [[ -z \$command ]]; then
+        return 0
+    fi
     READLINE_LINE=\$command
     # bash 5 counts READLINE_POINT in characters, as \${#} does in a UTF-8 locale.
     READLINE_POINT=\${#READLINE_LINE}
@@ -247,14 +250,18 @@ EOF
 __sol_widget() {
     local request=\$BUFFER command
     [[ -n \${request//[[:space:]]/} ]] || return 0
-    command=\$(SOL_ALIASES="\$(alias)" SOL_HISTORY="\$(fc -ln -$HISTORY_LINES 2>/dev/null)" SOL_CWD="\$PWD" SOL_SHELL="zsh \$ZSH_VERSION" $self -- "\$request")
-    if [[ \$? -ne 0 || -z \$command ]]; then
-        # sol wrote why below the line; draw the prompt again under it.
+    local output
+    # SOL_FEEDBACK: sol draws a spinner on this line while it waits. Its stdout and stderr are
+    # taken together: the command when it succeeds, the reason when it fails.
+    output=\$(SOL_FEEDBACK=1 SOL_ALIASES="\$(alias)" SOL_HISTORY="\$(fc -ln -$HISTORY_LINES 2>/dev/null)" SOL_CWD="\$PWD" SOL_SHELL="zsh \$ZSH_VERSION" $self -- "\$request" 2>&1)
+    if [[ \$? -ne 0 || -z \$output ]]; then
         zle reset-prompt
+        [[ -n \$output ]] && zle -M "\$output"
         return 0
     fi
-    BUFFER=\$command
+    BUFFER=\$output
     CURSOR=\${#BUFFER}
+    zle reset-prompt
 }
 zle -N __sol_widget
 bindkey '^G' __sol_widget
@@ -265,6 +272,44 @@ EOF
             return 2
             ;;
     esac
+}
+
+# While vazhi answers, a dim spinner with the elapsed time on the terminal's current line:
+# `| sol: thinking 1.2s`. Only when the widget asks (SOL_FEEDBACK=1) and a terminal is there;
+# the shell redraws its line when the widget returns. Writes to fd 3, the terminal.
+sol_spinner() {
+    local frames="|/-\\" i=0 start=${EPOCHREALTIME/./} now ms
+    while :; do
+        now=${EPOCHREALTIME/./}
+        ms=$(((now - start) / 1000))
+        printf '\r\e[2K\e[2m%s sol: thinking %d.%ds\e[0m' "${frames:i++%4:1}" $((ms / 1000)) $((ms % 1000 / 100)) >&3
+        sleep 0.1
+    done
+}
+
+# Ask vazhi, with the spinner when asked for one. vazhi prints only an answer when it succeeds
+# and only why when it fails, so one capture holds either; the reason goes to stderr after the
+# spinner is cleared, so it stays on screen.
+sol_ask() {
+    local system=$1 request=$2 spinner="" status=0 answer
+    if [[ ${SOL_FEEDBACK:-} == 1 ]] && { exec 3>/dev/tty; } 2>/dev/null; then
+        sol_spinner &
+        spinner=$!
+        trap 'kill "$spinner" 2>/dev/null; printf "\r\e[2K" >&3; exit 130' INT TERM
+    fi
+    answer=$("${SOL_VAZHI:-vazhi}" ask --fast --system "$system" -- "$request" 2>&1) || status=$?
+    if [[ -n $spinner ]]; then
+        kill "$spinner" 2>/dev/null
+        wait "$spinner" 2>/dev/null
+        printf '\r\e[2K' >&3
+        trap - INT TERM
+        exec 3>&-
+    fi
+    if ((status)); then
+        [[ -n $answer ]] && printf '%s\n' "$answer" >&2
+        return "$status"
+    fi
+    printf '%s' "$answer"
 }
 
 main() {
@@ -312,7 +357,7 @@ main() {
         printf '%s\n\n%s\n' "$system" "$request"
         return 0
     fi
-    answer=$("${SOL_VAZHI:-vazhi}" ask --fast --system "$system" -- "$request") || {
+    answer=$(sol_ask "$system" "$request") || {
         local status=$?
         # vazhi has already said why on stderr; 127 means it is not installed.
         ((status == 127)) && echo "sol: vazhi not found; install it or set SOL_VAZHI" >&2

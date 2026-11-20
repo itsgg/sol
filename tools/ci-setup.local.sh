@@ -3,3 +3,5 @@
 set -euo pipefail
 sudo apt-get update -qq
 sudo apt-get install -y -qq zsh
+# The screen tests run pyte through uv (SPEC REQ-WIDGET-06).
+pipx install uv >/dev/null
