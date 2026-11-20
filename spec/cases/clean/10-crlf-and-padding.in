@@ -1,0 +1,2 @@
+  tar -czf logs.tar.gz logs  
+

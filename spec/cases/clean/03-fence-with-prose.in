@@ -1,0 +1,7 @@
+Here is the command:
+
+```sh
+git reset --soft HEAD~1
+```
+
+This keeps your changes.
