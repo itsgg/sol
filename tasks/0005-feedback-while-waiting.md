@@ -1,6 +1,6 @@
 # 0005: Feedback while sol waits
 
-Status: review
+Status: done
 Depends on: 0004
 Spec: REQ-WIDGET-06
 Goal: Ctrl+G shows that sol is working, with the time so far, and leaves a clean line or the reason (change 0004).
@@ -15,3 +15,4 @@ Acceptance:
 
 - 2026-11-20: created at GG's word.
 - 2026-11-20: built. The screen test fails its spinner checks on the old sol and passes on the new one, in bash and zsh; the failure checks pass on both, guarding the behavior the spinner shares a line with.
+- 2026-11-20: landed; CI ran the screen test on Ubuntu; done.
