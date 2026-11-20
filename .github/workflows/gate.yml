@@ -1,0 +1,33 @@
+# The full gate on a clean machine. It reports; the local gate and tools/land
+# are what block a merge.
+name: gate
+
+on:
+  push:
+    branches: [main]
+  # With LANDING=pr, main moves only by squashing an up-to-date pull request
+  # this gate passed, so the push that follows is that same tree.
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # A project that needs system packages in CI (a database for its tests, say) installs them in
+      # tools/ci-setup.local.sh, its own file, which template updates never touch.
+      - name: Project setup
+        if: hashFiles('tools/ci-setup.local.sh') != ''
+        run: bash tools/ci-setup.local.sh
+      - name: The gate
+        env:
+          GATE_CI: "1"
+          # A push checks each commit it adds; a pull request, each commit past its target.
+          GATE_BASE: ${{ github.event.before }}
+        run: tools/gate

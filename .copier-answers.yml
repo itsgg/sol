@@ -1,0 +1,10 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: v0.1.41
+_src_path: git@github.com:itsgg/vithai.git
+description: Plain words to a shell command on Ctrl+G, through vazhi's free models
+display_name: Sol
+kind: tool
+landing: ff
+project_name: sol
+stacks: []
+subject_style: conventional

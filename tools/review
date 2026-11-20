@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# One read-only review of a change by a model family other than any of its
+# authors' (rules.md, Git). Prints the review and saves it outside the
+# repository, in $AGENT_STATE/reviews; nothing about the review goes into a commit.
+#
+#   tools/review --author-family F[,F...] --head REF [--base REF] [--workdir DIR] [--gate-summary FILE] [--fresh]
+#
+# Families are openai, google and anthropic. Reviewers and models are
+# configured in tools/review.conf. The reviewer reads an exact export of the
+# head with no git repository (tools/checks.py export), unless WORKDIR says
+# otherwise. Claude's plan mode keeps the reviewer read-only;
+# agy's plan mode is a prompt prefix and its headless mode may write inside
+# the export, which is thrown away; Codex runs in its read-only sandbox. A reply that exits
+# non-zero or has no text is a failed attempt; three failed attempts move on
+# to the next family, and so does one reply saying the reviewer is out of usage.
+# REVIEW_COMMAND, when set, replaces the reviewer (vithai's tests use it): it
+# gets the prompt file and the reviewer's name, and prints stream-json.
+# Completed reports are reused only with matching provenance and contents;
+# findings are printed unchanged for the coordinator to assess.
+set -euo pipefail
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+# shellcheck source=tools/review.conf
+. tools/review.conf
+
+# What a reviewer says when it did not review: it could not see the change.
+REFUSED="(can ?not|could not|unable to) (complete|perform|do|finish) (this|the) review|(the )?diff (was|is) (omitted|not included)|paste the diff"
+authors=${REVIEW_AUTHOR_FAMILY:-}
+base=main
+head=""
+workdir=""
+summary=""
+fresh_review=0
+while [ $# -gt 0 ]; do
+    case $1 in
+        --author-family) authors=${2:?}; shift 2 ;;
+        --base) base=${2:?}; shift 2 ;;
+        --head) head=${2:?}; shift 2 ;;
+        --workdir) workdir=${2:?}; shift 2 ;;
+        --gate-summary) summary=${2:?}; shift 2 ;;
+        --fresh) fresh_review=1; shift ;;
+        *) echo "ERROR unknown argument $1" >&2; exit 2 ;;
+    esac
+done
+[ -n "$head" ] || { echo "ERROR say which change to review: --head REF" >&2; exit 2; }
+authors=$(printf '%s' "$authors" | tr -d '[:space:]')
+[ -n "$authors" ] || { echo "ERROR say who wrote the change: --author-family openai|google|anthropic[,...]" >&2; exit 2; }
+for family in ${authors//,/ }; do
+    case $family in openai|google|anthropic) ;; *) echo "ERROR unknown family $family" >&2; exit 2 ;; esac
+done
+
+project=$(sed -n 's/^PROJECT=//p' tools/gate.conf)
+state=${AGENT_STATE:-$HOME/.local/share/$project}
+mkdir -p "$state/reviews"
+b=$(git rev-parse "$base^{commit}")
+h=$(git rev-parse "$head^{commit}")
+[ -n "$(git diff --stat "$b" "$h")" ] || { echo "ERROR nothing to review between $base and $head" >&2; exit 2; }
+# agy took 113 s on a 23-file change and timed out with no text at 180 s.
+if [ -z "$REVIEW_TIMEOUT" ]; then
+    changed=$(git diff --name-only "$b" "$h" | wc -l)
+    REVIEW_TIMEOUT=$((120 + 15 * changed))
+    [ "$REVIEW_TIMEOUT" -ge 180 ] || REVIEW_TIMEOUT=180
+    [ "$REVIEW_TIMEOUT" -le 900 ] || REVIEW_TIMEOUT=900
+fi
+# A report alone proves neither its full commit range nor how it was run.
+# Keep provenance separately, and compare it without evaluating state as shell.
+review_context() {
+    local who=$1 runner=$1
+    {
+        sha256sum tools/review tools/review.conf tools/checks.py tools/review-prompt.md
+        printf '%s\n' "${REVIEW_COMMAND:-}" "${AGY_MODEL:-}" "${AGY_EFFORT:-}"
+        if [ -n "$summary" ]; then sha256sum "$summary" | cut -d ' ' -f1; else printf 'no gate summary\n'; fi
+        if [ -n "${REVIEW_COMMAND:-}" ]; then
+            [ ! -f "$REVIEW_COMMAND" ] || sha256sum "$REVIEW_COMMAND"
+            # Test runners can depend on arbitrary environment inputs. Hash
+            # them here; credentials never appear in the stored metadata.
+            env | LC_ALL=C sort
+        else
+            runner=$(command -v "$runner" || true)
+            printf '%s\n' "$runner"
+            [ ! -f "$runner" ] || sha256sum "$runner"
+        fi
+    } | sha256sum | cut -d ' ' -f1
+}
+review_metadata() {
+    local who=$1 family=$2 digest=$3 context=$4
+    printf 'base=%s\nhead=%s\nfamily=%s\nreviewer=%s\ncontext=%s\nreport=%s\n' \
+        "$b" "$h" "$family" "$who" "$context" "$digest"
+}
+for entry in $REVIEWERS; do
+    family=${entry%%:*}
+    who=${entry#*:}
+    case ",$authors," in *",$family,"*) continue ;; esac
+    out="$state/reviews/$(git rev-parse --short=12 "$h")-$who.md"
+    context=$(review_context "$who")
+    if [ "$fresh_review" = 0 ] && [ -s "$out" ] && [ -f "$out.key" ]; then
+        # Validate and print the same snapshot if another review publishes
+        # a report concurrently. Reports have exactly one ending newline.
+        cached=$(cat "$out")
+        digest=$(printf '%s\n' "$cached" | sha256sum | cut -d ' ' -f1)
+        if cmp -s "$out.key" <(review_metadata "$who" "$family" "$digest" "$context"); then
+            printf 'reusing completed review from %s; assess its findings before landing\n\n' "$out"
+            printf '%s\n' "$cached"
+            exit 0
+        fi
+    fi
+done
+prompt=$(mktemp -p "$state/reviews" .prompt.XXXXXX)
+stream=$(mktemp -p "$state/reviews" .stream.XXXXXX)
+made_workdir=""
+reviewer_pid=""
+progress_pid=""
+cleanup() {
+    [ -z "$progress_pid" ] || kill "$progress_pid" 2>/dev/null || true
+    [ -z "$reviewer_pid" ] || kill -KILL -- "-$reviewer_pid" 2>/dev/null || true
+    rm -f -- "$prompt" "$stream"
+    [ -z "$made_workdir" ] || rm -rf -- "$workdir"
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+if [ -z "$workdir" ]; then
+    workdir=$(mktemp -d -p "$state/reviews" .tree.XXXXXX)
+    made_workdir=1
+    python3 -I tools/checks.py export "$h" "$workdir" >/dev/null
+fi
+python3 -I tools/checks.py review-prompt "$b" "$h" ${summary:+"$summary"} >"$prompt"
+
+run_reviewer() {
+    local who=$1 text
+    local command=()
+    text=$(cat "$prompt")
+    if [ -n "${REVIEW_COMMAND:-}" ]; then
+        command=("$REVIEW_COMMAND" "$prompt" "$who")
+    else
+        case $who in
+            agy) command=(agy -p "$text" --mode plan --model "$AGY_MODEL" --effort "$AGY_EFFORT" --output-format stream-json) ;;
+            claude) command=(claude -p "$text" --permission-mode plan --output-format stream-json --verbose) ;;
+            codex) command=(codex exec --sandbox read-only --skip-git-repo-check --ephemeral --json "$text") ;;
+            *) echo "ERROR unknown reviewer $who in tools/review.conf" >&2; return 2 ;;
+        esac
+    fi
+    cd "$workdir"
+    exec timeout --kill-after="$REVIEW_KILL_AFTER" "$REVIEW_TIMEOUT" "${command[@]}" </dev/null
+}
+
+for entry in $REVIEWERS; do
+    family=${entry%%:*}
+    who=${entry#*:}
+    case ",$authors," in *",$family,"*) continue ;; esac
+    context=$(review_context "$who")
+    for attempt in 1 2 3; do
+        status=0
+        started=$SECONDS
+        printf 'reviewing %s: attempt %s/3, timeout %ss, kill grace %ss\n' "$who" "$attempt" "$REVIEW_TIMEOUT" "$REVIEW_KILL_AFTER" >&2
+        run_reviewer "$who" >"$stream" 2>&1 &
+        reviewer_pid=$!
+        (
+            sleep_pid=""
+            trap '[ -z "$sleep_pid" ] || kill "$sleep_pid" 2>/dev/null || true; exit 0' TERM INT
+            while true; do
+                sleep "$REVIEW_PROGRESS_INTERVAL" &
+                sleep_pid=$!
+                wait "$sleep_pid" || exit 0
+                sleep_pid=""
+                kill -0 "$reviewer_pid" 2>/dev/null || exit 0
+                printf 'reviewing %s: attempt %s/3, elapsed %ss, waiting for verdict\n' "$who" "$attempt" "$(( SECONDS - started ))" >&2
+            done
+        ) &
+        progress_pid=$!
+        wait "$reviewer_pid" || status=$?
+        reviewer_pid=""
+        kill "$progress_pid" 2>/dev/null || true
+        wait "$progress_pid" 2>/dev/null || true
+        progress_pid=""
+        printf 'reviewing %s: attempt %s/3 finished in %ss (exit %s)\n' "$who" "$attempt" "$(( SECONDS - started ))" "$status" >&2
+        review=$(python3 -I tools/checks.py stream-text <"$stream")
+        # A reply that says it could not review is no review, like an empty one.
+        if [ "$status" -eq 0 ] && printf '%s' "$review" | grep -qiE "$REFUSED"; then
+            echo "review attempt $attempt by $who did not review: $(printf '%s' "$review" | head -c 160 | tr '\n' ' ')" >&2
+            continue
+        fi
+        if [ "$status" -eq 0 ] && [ -n "${review//[[:space:]]/}" ]; then
+            out="$state/reviews/$(git rev-parse --short=12 "$h")-$who.md"
+            fresh=$(mktemp -p "$state/reviews" .report.XXXXXX)
+            {
+                printf 'Review of %s..%s by %s (%s), attempt %s, %s\n\n' "$(git rev-parse --short=12 "$b")" \
+                    "$(git rev-parse --short=12 "$h")" "$who" "$family" "$attempt" "$(date -u +%Y-%m-%dT%H:%MZ)"
+                printf '%s\n' "$review"
+            } >"$fresh"
+            digest=$(sha256sum "$fresh" | cut -d ' ' -f1)
+            metadata=$(mktemp -p "$state/reviews" .metadata.XXXXXX)
+            review_metadata "$who" "$family" "$digest" "$context" >"$metadata"
+            mv -f -- "$fresh" "$out"
+            mv -f -- "$metadata" "$out.key"
+            printf 'review saved to %s\n\n%s\n' "$out" "$review"
+            exit 0
+        fi
+        echo "review attempt $attempt by $who failed (exit $status, $(printf '%s' "$review" | wc -c) bytes of text)" >&2
+        if grep -qiE "out of usage|usage limit|quota exceeded|quota reached|RESOURCE_EXHAUSTED|rate limit|ActionRequiredError" "$stream"; then
+            echo "$who is out of usage; trying the next family" >&2
+            break
+        fi
+    done
+done
+echo "ERROR no reviewer outside the $authors families gave a review; see tools/review.conf" >&2
+exit 1

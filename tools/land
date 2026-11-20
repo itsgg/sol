@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+# Land a branch on main, for the coordinator (AGENTS.md, Landing):
+#
+#   tools/land check BRANCH [--author-family F[,F...]] [--no-review|--review-new] [--fresh-gate]
+#       Runs main's full gate on BRANCH (for agent/NAME in a fresh clone made
+#       inside the agent's sandbox, so nothing in the agent's worktree or
+#       index counts; in a scratch worktree otherwise), checks the gate
+#       left the tree as it found it, checks with main's own tools that every
+#       protected change and test edit on BRANCH is declared, then has one model family outside
+#       every author's review an exact export of BRANCH's tree. Verify each finding; fix the real
+#       ones with tests on BRANCH; then check again with --no-review, which
+#       needs a reviewed ancestor and lists what the review did not see. A
+#       branch that only adds or edits task files needs no review, and nor
+#       does one that is exactly the template at the tag its answers name,
+#       which the template's own gate and review covered.
+#   tools/land merge BRANCH [--accept-protected]
+#       Fast-forwards main to BRANCH once its last check passed. Declared
+#       protected changes and removed or edited tests need --accept-protected; one that
+#       loosens or removes a check waits for GG.
+#   tools/land push
+#       Pushes main, as its own command.
+#
+# With LANDING=pr in tools/gate.conf, main moves only on GitHub: check and
+# merge first bring the local main up to origin's, and merge pushes BRANCH,
+# opens (or reuses) its pull request, waits for the required checks, squash-
+# merges it with the branch's commit messages and brings main up to the
+# result, whose tree must be BRANCH's; push then has nothing to do.
+#
+# The authors of agent/NAME are every harness tools/agent-loop has started
+# for it (its session log), never an argument. Its commits are written to the agent's own object
+# store and copied into the repository's by tools/agent-loop as it runs; merge copies any still missing.
+set -euo pipefail
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+conf() { sed -n "s/^$1=//p" tools/gate.conf tools/gate.local.conf 2>/dev/null | tail -n 1 | tr -d "\"'"; }
+project=$(conf PROJECT)
+landing=$(conf LANDING)
+landing=${landing:-ff}
+poll=${LAND_POLL_SECONDS:-10}
+state=${AGENT_STATE:-$HOME/.local/share/$project}
+mkdir -p "$state/land"
+
+die() { echo "ERROR $*" >&2; exit 1; }
+on_main_clean() {
+    [ "$(git branch --show-current)" = main ] || die "land runs on main; this checkout is on $(git branch --show-current)"
+    # An untracked file (an unfinished draft) does not block a landing: git
+    # itself refuses a merge that would overwrite one.
+    [ -z "$(git status --porcelain --untracked-files=no)" ] || die "main has uncommitted changes"
+}
+record() { echo "$state/land/$(echo "$1" | tr '/' '-')"; }
+case $landing in ff|pr) ;; *) die "LANDING in tools/gate.conf is $landing; it is ff or pr" ;; esac
+# With LANDING=pr, bring main up to origin's before a branch is judged against it.
+# One lander at a time moves this checkout's main: merge and push hold the lock
+# to their end, check only while it syncs main. It lives in the git common dir,
+# so every worktree and anything else writing this checkout shares it.
+lock_checkout() {
+    exec 9>"$(git rev-parse --git-common-dir)/land.lock"
+    flock 9
+}
+sync_main() {
+    [ "$landing" = pr ] || return 0
+    git fetch -q origin main || die "could not fetch main from origin"
+    git merge -q --ff-only origin/main || die "main has commits origin does not; with LANDING=pr main moves only through pull requests"
+}
+# tasks_only TIP: main..TIP, merges included, only adds or edits task files.
+# An edit to a task's Acceptance is refused earlier, by main's declarations check.
+tasks_only() {
+    local changes status path
+    changes=$(git diff --name-status --no-renames main "$1") || return 1
+    [ -n "$changes" ] || return 1
+    while IFS=$'\t' read -r status path; do
+        case $status in A|M) ;; *) return 1 ;; esac
+        [[ $path =~ ^tasks/[0-9]{4}-[a-z0-9-]+\.md$ ]] || return 1
+    done <<<"$changes"
+}
+# template_only TIP: main..TIP is exactly what Copier renders onto main for the
+# template tag TIP's .copier-answers.yml names, so the template's own gate and
+# review covered it. Anything else on the branch, an edit by hand or a conflict
+# left in, makes the trees differ; so does a render that cannot run.
+# The work runs in a subshell, so its scratch worktree goes however it ends, a
+# kill included, and the worktree is made with the project's hooks off.
+template_only() (
+    tip=$1
+    ! git diff --quiet main "$tip" -- .copier-answers.yml || exit 1
+    tag=$(git show "$tip:.copier-answers.yml" | sed -n 's/^_commit: //p')
+    [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+    repo=$PWD
+    scratch=$(mktemp -d -p "$state/land" .template.XXXXXX)
+    # The cleanup steps out of the tree first and cannot fail the check itself.
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+    trap 'cd "$repo" && { git worktree remove --force "$scratch/tree" >/dev/null 2>&1; git worktree prune; rm -rf -- "$scratch"; } || true' EXIT
+    git -c core.hooksPath=/dev/null worktree add -q --detach "$scratch/tree" main 2>/dev/null || exit 1
+    cd "$scratch/tree" || exit 1
+    uvx --quiet copier==9.19.1 update --quiet --trust --defaults --skip-answered --skip-tasks \
+        --conflict inline --vcs-ref "$tag" >/dev/null 2>&1 || exit 1
+    git add -A && git diff --cached --quiet "$tip"
+)
+# land_pr BRANCH TIP: put TIP on main through a squash-merged pull request.
+land_pr() {
+    local branch=$1 tip=$2 remote n url subject body pr_body out status tries=0 outages=0
+    command -v gh >/dev/null || die "LANDING=pr needs gh, signed in"
+    remote=$(git ls-remote origin "refs/heads/$branch" | cut -f1)
+    if [ -z "$remote" ] || git merge-base --is-ancestor "$remote" "$tip" 2>/dev/null; then
+        git push -q origin "$tip:refs/heads/$branch" || die "could not push $branch to origin"
+    else
+        # An earlier landing left an older $branch there (a rebase since); replace exactly that one.
+        git push -q --force-with-lease="refs/heads/$branch:$remote" origin "$tip:refs/heads/$branch" \
+            || die "could not replace the older $branch on origin"
+    fi
+    # The squash commit's subject: the branch's oldest commit that is not a
+    # task claim (an agent's branch starts with one), or an open pull request's
+    # title, which whoever opened it chose.
+    subject=$(git log --reverse --format=%s "main..$tip" | grep -v -E '^chore: claim [0-9]{4}$' | sed -n 1p || true)
+    [ -n "$subject" ] || subject=$(git log --reverse --format=%s "main..$tip" | sed -n 1p)
+    if [ "$(git rev-list --count "main..$tip")" = 1 ]; then
+        body=$(git log -1 --format=%b "$tip")
+    else
+        body=$(git log --reverse --format='* %s%n%n%b' "main..$tip")
+    fi
+    n=$(gh pr list --head "$branch" --base main --state open --json number --jq '.[0].number // empty') \
+        || die "gh could not list the pull requests of $branch"
+    if [ -z "$n" ]; then
+        # GitHub refuses a pull request body past 65536 characters; the squash
+        # commit below still carries every message, declarations included.
+        pr_body=$body
+        [ "${#pr_body}" -le 60000 ] || pr_body="${body:0:60000}
+
+(cut at 60000 characters; the squash commit keeps every message)"
+        url=$(printf '%s\n' "$pr_body" | gh pr create --base main --head "$branch" --title "$subject" --body-file -) \
+            || die "gh could not open a pull request for $branch"
+        n=${url##*/}
+    else
+        title=$(gh pr view "$n" --json title --jq .title) || die "gh could not read the title of #$n"
+        [ -z "$title" ] || subject=$title
+    fi
+    echo "waiting for the required checks of #$n"
+    while :; do
+        status=0
+        out=$(gh pr checks "$n" --required --watch --fail-fast --interval "$poll" 2>&1) || status=$?
+        [ "$status" = 0 ] && break
+        case $out in
+            *"no required checks reported"*|*"no checks reported"*)
+                tries=$((tries + 1))
+                [ "$tries" -lt 30 ] || die "no required check reported on #$n after $((30 * poll))s"
+                sleep "$poll"
+                ;;
+            *"HTTP 50"[0-9]*|*"Bad Gateway"*|*"Gateway Timeout"*|*"Service Unavailable"*|*"error connecting to api.github.com"*)
+                # GitHub did not answer; the checks may still pass. Not the branch's failure.
+                outages=$((outages + 1))
+                [ "$outages" -lt 30 ] || die "GitHub did not answer while watching #$n for $((30 * poll))s; nothing was merged, run tools/land merge $branch again"
+                echo "GitHub did not answer ($(printf '%s\n' "$out" | tail -n 1)); watching #$n again" >&2
+                sleep "$poll"
+                ;;
+            *)
+                printf '%s\n' "$out" | tail -n 20 >&2
+                die "a required check did not pass on #$n; fix it on $branch, check it again and land"
+                ;;
+        esac
+    done
+    printf '%s\n' "$body" | gh pr merge "$n" --squash --subject "$subject (#$n)" --body-file - --match-head-commit "$tip" \
+        || die "gh could not merge #$n"
+    # GitHub may delete a merged branch itself; one left behind is replaced at its next landing.
+    git push -q origin --delete "$branch" >/dev/null 2>&1 || true
+    git fetch -q origin main || die "#$n merged, but main could not be fetched; run: git pull --ff-only"
+    git merge -q --ff-only origin/main || die "#$n merged, but the local main could not follow origin's"
+    [ "$(git rev-parse "HEAD^{tree}")" = "$(git rev-parse "$tip^{tree}")" ] \
+        || die "main's tree after #$n is not $branch's; look at what else reached main"
+    echo "merged $branch as #$n; main is at $(git rev-parse --short HEAD), on origin already"
+}
+family_of() {
+    case $1 in claude) echo anthropic ;; codex) echo openai ;; agy) echo google ;; *) return 1 ;; esac
+}
+
+cmd=${1:-}
+branch=${2:-}
+agent=""
+case $branch in
+    agent/*)
+        agent=${branch#agent/}
+        # Host git reads the agent's commits from its object store, read-only.
+        export GIT_ALTERNATE_OBJECT_DIRECTORIES="$state/agents/$agent/objects"
+        ;;
+esac
+
+# sandbox_gate NAME: run main's full gate on $tip inside tools/agent-loop's
+# sandbox as agent NAME, in a fresh clone at the tip, so the branch's index,
+# worktree settings and code play no part on the host; sets summary.
+sandbox_gate() {
+    local name=$1 common objects gate_cmd logs before_logs
+    common=$(git rev-parse --path-format=absolute --git-common-dir)
+    objects="$state/agents/$name/objects"
+    # The gate must leave that clone's HEAD and tree as they were.
+    # Main's own gate, settings and checks judge the branch's tree.
+    gate_cmd="set -e; t=\$(mktemp -d); unset GIT_OBJECT_DIRECTORY; export GIT_ALTERNATE_OBJECT_DIRECTORIES='$objects'
+git clone -q --shared --no-checkout '$common' \"\$t/repo\"; cd \"\$t/repo\"; git checkout -q --detach '$tip'
+mkdir \"\$t/main\"; git archive '$main_tip' tools | tar -x -C \"\$t/main\"
+tools/install-hooks >/dev/null; status=0; GATE_BRANCH='$branch' GATE_ROOT=\"\$t/repo\" \"\$t/main/tools/gate\" || status=\$?
+$verify || { echo 'ERROR the gate moved HEAD or changed the tree'; exit 1; }; exit \$status"
+    logs="$state/agents/$name/logs"
+    # A first run has no log directory yet; under pipefail a failed ls would end tools/land.
+    before_logs=$({ ls "$logs" 2>/dev/null || true; } | wc -l)
+    AGENT_SHELL_CMD="$gate_cmd" tools/agent-loop "$name" shell 1 || {
+        tail -n 30 "$(ls -t "$logs"/*.jsonl | sed -n 1p)" >&2
+        die "the full gate failed on $branch"
+    }
+    [ "$(ls "$logs" | wc -l)" -gt "$before_logs" ] || die "the gate session left no log"
+    summary=$(ls -t "$logs"/*.jsonl | sed -n 1p)
+}
+
+case $cmd in
+check)
+    [ -n "$branch" ] || die "usage: tools/land check BRANCH"
+    shift 2
+    authors=${REVIEW_AUTHOR_FAMILY:-}
+    review=1
+    fresh_gate=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --author-family) [ -z "$agent" ] || die "the authors of $branch come from its session log, not an argument"; authors=${2:?}; shift 2 ;;
+            --no-review) review=0; shift ;;
+            # A fix round: the review sees only what the branch's last review did not.
+            --review-new) review=new; shift ;;
+            --fresh-gate) fresh_gate=1; shift ;;
+            *) die "unknown argument $1" ;;
+        esac
+    done
+    on_main_clean
+    lock_checkout
+    sync_main
+    exec 9>&-
+    tip=$(git rev-parse --verify "$branch^{commit}")
+    main_tip=$(git rev-parse --verify main)
+    git merge-base --is-ancestor main "$tip" || die "$branch does not contain main; rebase it onto main first"
+    verify='[ "$(git rev-parse HEAD)" = "'"$tip"'" ] && [ -z "$(git status --porcelain)" ]'
+    checkpoint="$state/land/checks/$tip-$main_tip.json"
+    saved_summary="$checkpoint.summary"
+    if [ -n "$agent" ]; then
+        log="$state/agents/$agent/sessions.log"
+        authors=$(python3 -I tools/checks.py acp-authors "$log" "$agent" "$branch") || die "ACP author provenance failed for $branch"
+        if [ -f "$log" ]; then
+            while read -r _ harness _; do
+                fam=$(family_of "$harness") || continue
+                case ",$authors," in *",$fam,"*) ;; *) authors=${authors:+$authors,}$fam ;; esac
+            done <"$log"
+        fi
+        [ -n "$authors" ] || die "no session in $log, so who wrote $branch is unknown"
+        sandbox_gate "$agent"
+    elif [ "${LAND_SANDBOX:-}" = 1 ]; then
+        # A branch that is not an agent's but whose code GG has not read, such
+        # as one Arivu adopted on an agent's word, gets the agent sandbox too:
+        # on the host its acceptance would run with GG's rights.
+        echo "running the full gate on $branch in the lander's sandbox"
+        sandbox_gate lander
+    elif [ "$fresh_gate" = 0 ] && python3 -I tools/checks.py landing-cache load "$checkpoint" "$tip" "$main_tip" "$saved_summary" 2>/dev/null; then
+        echo "reusing completed full gate for $(git rev-parse --short "$tip") against $(git rev-parse --short "$main_tip")"
+        summary=$saved_summary
+    else
+        gate_context=$(python3 -I tools/checks.py landing-cache key "$checkpoint" "$tip" "$main_tip" "$saved_summary")
+        workdir=$(mktemp -d -p "$state/land" wt.XXXXXX)
+        trap 'git worktree remove --force "$workdir" >/dev/null 2>&1 || true' EXIT
+        git worktree add -q --detach "$workdir" "$tip"
+        # A pull request's required check runs the full gate on a clean machine
+        # before the merge, so a branch of task files alone gets the turn tier here.
+        tier=full
+        if [ "$landing" = pr ] && tasks_only "$tip"; then
+            tier=turn
+            echo "$branch only adds or edits task files; the pull request's required check runs the full gate"
+        fi
+        # Main's own gate, settings and checks judge the branch's tree.
+        (cd "$workdir" && tools/install-hooks >/dev/null && GATE_BRANCH=$branch GATE_ROOT=$workdir "$root/tools/gate" "--$tier") \
+            || die "the $tier gate failed on $branch"
+        (cd "$workdir" && eval "$verify") || die "the gate moved HEAD or changed the tree in $workdir"
+        summary="$workdir/.gate/summary"
+        python3 -I tools/checks.py landing-cache save "$checkpoint" "$tip" "$main_tip" "$summary" "$gate_context"
+    fi
+    # The branch's gate ran the branch's own checks; main's checks and
+    # protected list judge the declarations, so a branch cannot edit them away.
+    GATE_BRANCH=$branch python3 -I tools/checks.py declarations main "$tip" || die "undeclared protected changes or test edits on $branch"
+    rec=$(record "$branch")
+    if [ "$review" != 0 ]; then
+        [ -n "$authors" ] || die "say who wrote $branch: --author-family openai|google|anthropic[,...]"
+        since=main
+        if [ "$review" = new ]; then
+            earlier=$(sed -n 's/^reviewed=//p' "$rec" 2>/dev/null || true)
+            # Only the commits after the earlier review, and none of main's: the
+            # branch still holds that head, and forks from main at or before it.
+            if [ -n "$earlier" ] && [ "$earlier" != "$tip" ] && git merge-base --is-ancestor "$earlier" "$tip" \
+                && git merge-base --is-ancestor "$(git merge-base main "$tip")" "$earlier"; then
+                since=$earlier
+                echo "reviewing what the review of $(git rev-parse --short "$earlier") did not see"
+            else
+                echo "no earlier review of $branch is part of it as it stands (rebased, or none); reviewing all of it"
+            fi
+        fi
+        tools/review --author-family "$authors" --base "$since" --head "$tip" --gate-summary "$summary" || die "no review"
+        reviewed=$tip
+    elif tasks_only "$tip"; then
+        # The coordinator writing tasks is documentation; GG reads a task's
+        # acceptance before a worker takes it.
+        echo "$branch only adds or edits task files, which need no review"
+        reviewed=""
+    elif template_only "$tip"; then
+        echo "$branch is the template at its tag, which the template's own gate and review covered"
+        reviewed=""
+    else
+        reviewed=$(sed -n 's/^reviewed=//p' "$rec" 2>/dev/null || true)
+        if [ -z "$reviewed" ] || ! git merge-base --is-ancestor "$reviewed" "$tip"; then
+            die "--no-review needs an earlier reviewed check of $branch, a branch that only adds or edits task files, or the template at its tag; this one is none"
+        fi
+        if [ "$reviewed" != "$tip" ]; then
+            echo "Not seen by the review, which covered up to $(git rev-parse --short "$reviewed"):"
+            git log --format='  %h %s' "$reviewed..$tip"
+            git diff --stat "$reviewed" "$tip" | sed 's/^/  /'
+        fi
+    fi
+    printf 'tip=%s\nreviewed=%s\n' "$tip" "$reviewed" >"$rec"
+    echo "checked $branch at $(git rev-parse --short "$tip"); after verifying the findings: tools/land merge $branch"
+    ;;
+merge)
+    [ -n "$branch" ] || die "usage: tools/land merge BRANCH [--accept-protected]"
+    accept=0
+    [ "${3:-}" = --accept-protected ] && accept=1
+    on_main_clean
+    lock_checkout
+    sync_main
+    rec=$(record "$branch")
+    [ -f "$rec" ] || die "run tools/land check $branch first"
+    tip=$(git rev-parse --verify "$branch^{commit}")
+    [ "$(sed -n 's/^tip=//p' "$rec")" = "$tip" ] || die "$branch moved since its check; run tools/land check $branch again"
+    git merge-base --is-ancestor main "$tip" || die "main moved since $branch was checked; rebase $branch onto main and check it again"
+    declared=$(git log --format=%B "main..$tip" | grep -E '^(Protected|Removes test|Modifies test):' || true)
+    if [ -n "$declared" ] && [ "$accept" = 0 ]; then
+        echo "$branch declares changes to protected paths or tests:"
+        printf '%s\n' "$declared" | sed 's/^/  /'
+        die "accept them with --accept-protected if they add or tighten checks; a change that loosens or removes one waits for GG"
+    fi
+    if [ -n "$agent" ]; then
+        # tools/agent-loop copies the agent's objects in as it runs; copy any
+        # still missing, so main never depends on the agent's store.
+        if ! env -u GIT_ALTERNATE_OBJECT_DIRECTORIES git rev-list --objects "main..$tip" >/dev/null 2>&1; then
+            git rev-list --objects "main..$tip" | git pack-objects --quiet --stdout \
+                | env -u GIT_ALTERNATE_OBJECT_DIRECTORIES git index-pack --stdin --strict >/dev/null
+        fi
+        env -u GIT_ALTERNATE_OBJECT_DIRECTORIES git rev-list --objects "main..$tip" >/dev/null \
+            || die "the agent's objects did not reach the repository's store; nothing was merged"
+    fi
+    if [ "$landing" = pr ]; then
+        land_pr "$branch" "$tip"
+        rm -f "$rec"
+    else
+        git merge -q --ff-only "$tip"
+        rm -f "$rec"
+        echo "merged $branch; main is at $(git rev-parse --short HEAD). Push with: tools/land push"
+    fi
+    ;;
+push)
+    [ "$(git branch --show-current)" = main ] || die "push runs on main"
+    lock_checkout
+    if [ "$landing" = pr ]; then
+        echo "with LANDING=pr, tools/land merge put main on origin already; nothing to push"
+        exit 0
+    fi
+    git push origin main
+    ;;
+*)
+    echo "usage: tools/land check BRANCH [--author-family F] [--no-review|--review-new] | merge BRANCH [--accept-protected] | push" >&2
+    exit 2
+    ;;
+esac

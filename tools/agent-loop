@@ -1,0 +1,508 @@
+#!/usr/bin/env bash
+# Run one build agent for some sessions, one task per session (AGENTS.md).
+#
+#   tools/agent-loop NAME HARNESS [SESSIONS]
+#   tools/agent-loop NAME HARNESS login
+#   tools/agent-loop NAME acp probe
+#
+# HARNESS is claude, codex, acp or agy (Google's Antigravity CLI, not Gemini CLI);
+# acp uses the coordinator JSON descriptor in AGENT_ACP_CONFIG and exposes raw
+# stdio for one session. Its argv is never evaluated as a shell command.
+# `probe` builds the same sandbox, asks the agent to initialize and open a
+# session (tools/acp-probe.py), and stops: no prompt, no worktree, no branch,
+# so a coordinator's canary can check the worker path without starting work.
+# A coordinator that approved particular tasks names them in AGENT_TASKS, one
+# four-digit number per session in order, and each session takes its task
+# instead of choosing one (AGENTS.md, Taking work). AGENT_BRIEF names a file
+# whose text every session's prompt carries after its own, such as review
+# findings the coordinator sends back to the agent that wrote the branch.
+# The model is whatever that harness defaults to unless AGENT_MODEL is set. The test harness `shell` runs AGENT_SHELL_CMD
+# in the sandbox instead (vithai's tests and tools/land use it). Each agent
+# works in its own worktree at ../<repository>-worktrees/NAME on the branch
+# agent/NAME, and its session logs go to $AGENT_STATE/agents/NAME/logs.
+#
+# The agent runs with its harness's permission prompts off, inside bubblewrap,
+# in a new PID and IPC namespace, with network access. The network namespace
+# is the host's, on purpose, so the harness reaches its API; that also means
+# the agent reaches localhost ports and abstract unix sockets (local model
+# servers, a database, 1Password's MCP and SDK sockets), accepted as a cost
+# of not running agents as another user. Its home is private and
+# empty apart from read-only toolchains and its own caches, so it cannot read
+# the host's credentials or home files, and cannot change anything the host
+# later runs (caches, toolchains, harness settings). /usr and /etc are bound
+# read-only for the system's programs, certificates and name resolution. Of the
+# repository's .git it sees everything, through an overlay whose writes go to
+# a throwaway layer, and keeps only what it writes to its own worktree's
+# metadata, the agent/* branches and its own object store: never main, hooks,
+# config or existing objects. Every agent can write every agent/* branch, not
+# only its own. While a session runs and after it, the host copies the
+# agent's new objects into the repository's store, each one checked by
+# `git index-pack --strict`, so the main checkout's git never meets a ref it
+# cannot read (for at most the two seconds between copies). It has no
+# credentials to push with. Before each session its harness
+# goes to $AGENT_STATE/agents/NAME/sessions.log, outside the sandbox, and
+# tools/land counts every harness there as an author of the branch.
+#
+# The host never runs git inside an agent's worktree: the agent controls the
+# worktree's .git file and metadata, so it could point git at a config with a
+# command in it (core.fsmonitor, say). The rebase before each session runs in
+# the sandbox. For the same reason, anything that builds or tests an agent's
+# branch runs in the sandbox too, landing included:
+#     AGENT_SHELL_CMD="tools/gate" tools/agent-loop NAME shell
+#
+# Agents run on GG's subscriptions. `login` runs the harness's own sign-in once,
+# interactively, inside the agent's sandbox (claude auth login --claudeai,
+# codex login --device-auth, or agy's first-run sign-in), so the login lives
+# only in the agent's private home: a session of its own, which a token refresh
+# inside the sandbox cannot use to sign the host out. The host's login files
+# are never copied in. Optionally, $AGENT_STATE/agent-auth.env (KEY=VALUE
+# lines, mode 600) adds environment variables, for example a subscription
+# token from `claude setup-token` as CLAUDE_CODE_OAUTH_TOKEN.
+set -euo pipefail
+
+usage="usage: tools/agent-loop NAME HARNESS [SESSIONS|login|probe]"
+name=${1:?$usage}
+harness=${2:?$usage}
+sessions=${3:-1}
+case $name in *[!a-z0-9-]*|'') echo "ERROR agent name must be lower-case letters, digits and dashes" >&2; exit 2 ;; esac
+login=0
+probe=0
+if [ "$sessions" = login ]; then login=1; sessions=1; fi
+if [ "$sessions" = probe ]; then probe=1; sessions=1; fi
+case $sessions in *[!0-9]*|'') echo "ERROR SESSIONS must be a number, login or probe" >&2; exit 2 ;; esac
+[ "$probe" = 0 ] || [ "$harness" = acp ] || { echo "ERROR only an acp agent is probed" >&2; exit 2; }
+
+repo=$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)
+common=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)
+project=$(sed -n 's/^PROJECT=//p' "$repo/tools/gate.conf")
+# The gate's own settings, as tools/gate reads them: its stacks, with any a
+# project adds in tools/gate.local.conf, and GATE_TOOLS there, the commands its
+# own gate steps run (bun for a web/ app, say), so the sandbox's gate has them.
+# shellcheck disable=SC1091
+settings=$(cd "$repo" && . tools/gate.conf && { [ ! -f tools/gate.local.conf ] || . tools/gate.local.conf; } && printf '%s\n%s\n' "${STACKS:-}" "${GATE_TOOLS:-}")
+stacks=$(sed -n 1p <<<"$settings")
+gate_tools=$(sed -n 2p <<<"$settings")
+state=${AGENT_STATE:-$HOME/.local/share/$project}
+data="$state/data"
+worktree=$(realpath -m "$repo/../$(basename "$repo")-worktrees/$name")
+private="$state/agents/$name"
+# The worker's home: its own, or an ACP account's shared login home the
+# coordinator names, so an account is signed in once for every project.
+home_dir="$private/home"
+logs="$private/logs"
+objects="$private/objects"
+saved_refs="$private/saved-refs"
+
+acp_requirements=""
+acp_runtime=""
+acp_socket=""
+acp_environment=()
+if [ "$harness" = acp ]; then
+    [ "$login" = 0 ] && [ "$sessions" = 1 ] || { echo "ERROR ACP needs exactly one session" >&2; exit 2; }
+    mapfile -d '' -t acp_fields < <(python3 -I "$repo/tools/checks.py" acp-config "${AGENT_ACP_CONFIG:?AGENT_ACP_CONFIG is required}")
+    # A refused descriptor prints only checks.py's ERROR line, which is the reason.
+    [ "${acp_fields[0]:-}" = ACP-CONFIG-1 ] && [ "${acp_fields[-1]:-}" = ACP-CONFIG-OK ] || {
+        printf '%s' "${acp_fields[@]}" >&2
+        echo "ERROR the ACP descriptor $AGENT_ACP_CONFIG was refused" >&2
+        exit 2
+    }
+    acp_requirements=${acp_fields[1]}
+    acp_runtime=${acp_fields[2]}
+    acp_socket=${acp_fields[3]}
+    acp_run_id=${acp_fields[4]}
+    acp_runtime_root=${acp_fields[5]}
+    [ -z "${acp_fields[6]}" ] || home_dir=${acp_fields[6]}
+    acp_offset=8
+    for ((acp_index=0; acp_index<acp_fields[7]; acp_index++)); do
+        acp_environment+=(--setenv "${acp_fields[acp_offset]}" "${acp_fields[acp_offset+1]}")
+        acp_offset=$((acp_offset + 2))
+    done
+    acp_cmd=("${acp_fields[@]:acp_offset:${#acp_fields[@]}-acp_offset-1}")
+fi
+
+runtime_manifest=""
+case $harness in claude|codex|agy) runtime_manifest=${AGENT_RUNTIME_MOUNTS:-} ;; esac
+[ "$harness" != acp ] || runtime_manifest=$acp_runtime
+prompt=$(sed "s/{{AGENT}}/$name/g" "$repo/tools/agent-prompt.md")
+if [ "$login" = 0 ] && [ -n "${AGENT_BRIEF:-}" ]; then
+    [ -r "$AGENT_BRIEF" ] || { echo "ERROR AGENT_BRIEF names $AGENT_BRIEF, which cannot be read" >&2; exit 2; }
+    prompt="$prompt
+
+$(cat "$AGENT_BRIEF")"
+fi
+tasks=()
+if [ "$login" = 0 ] && [ -n "${AGENT_TASKS:-}" ]; then
+    read -r -a tasks <<<"$AGENT_TASKS"
+    for task in "${tasks[@]}"; do
+        case $task in [0-9][0-9][0-9][0-9]) ;; *) echo "ERROR AGENT_TASKS lists four-digit task numbers" >&2; exit 2 ;; esac
+    done
+    [ "${#tasks[@]}" -ge "$sessions" ] || { echo "ERROR AGENT_TASKS names fewer tasks than sessions" >&2; exit 2; }
+    [ "$harness" != acp ] || { echo "ERROR AGENT_TASKS does not apply to acp; the coordinator names the task in its prompt" >&2; exit 2; }
+fi
+model=()
+[ -n "${AGENT_MODEL:-}" ] && model=(--model "$AGENT_MODEL")
+harness_cmd() {
+    case $harness:$login in
+        claude:0) cmd=(claude -p "$1" --dangerously-skip-permissions --output-format stream-json --verbose "${model[@]}") ;;
+        codex:0)  cmd=(codex exec --dangerously-bypass-approvals-and-sandbox --json -C "$worktree" "${model[@]/--model/-m}" "$1") ;;
+        agy:0)    cmd=(agy -p "$1" --dangerously-skip-permissions --output-format stream-json --print-timeout 0 "${model[@]}") ;;
+        acp:0) cmd=("${acp_cmd[@]}") ;;
+        shell:0)  cmd=(bash -c "${AGENT_SHELL_CMD:?AGENT_SHELL_CMD is required for the shell harness}") ;;
+        claude:1) cmd=(claude auth login --claudeai) ;;
+        codex:1)  cmd=(codex login --device-auth) ;;
+        agy:1)    cmd=(agy) ;;
+        shell:1)  cmd=(bash -c "${AGENT_SHELL_CMD:?AGENT_SHELL_CMD is required for the shell harness}") ;;
+        *) echo "ERROR harness must be claude, codex, agy, shell or acp" >&2; exit 2 ;;
+    esac
+}
+harness_cmd "$prompt"
+
+# Tools resolve to their real install directories, which are bound read-only.
+tools=("${cmd[0]}" git python3)
+for stack in $stacks; do
+    case $stack in
+        python) tools+=(uv) ;;
+        rust) tools+=(cargo) ;;
+        go) tools+=(go) ;;
+        typescript) tools+=(node npm) ;;
+    esac
+done
+read -r -a extra <<<"$gate_tools"
+tools+=("${extra[@]}")
+path=""
+tool_dirs=()
+command -v bwrap >/dev/null || { echo "ERROR bwrap (bubblewrap) not found on PATH" >&2; exit 2; }
+for tool in "${tools[@]}"; do
+    found=$(command -v "$tool") || { echo "ERROR $tool not found on PATH" >&2; exit 2; }
+    # mise's shims and command wrappers are links to mise itself, which picks the
+    # tool from config and data the sandbox lacks; the tool mise names is bound.
+    case $found in */mise/shims/*) dispatcher=1 ;; *) [ "$(basename "$(readlink -f "$found")")" = mise ] && dispatcher=1 || dispatcher=0 ;; esac
+    if [ "$dispatcher" = 1 ] && [ "$tool" != mise ]; then
+        found=$(mise which "$tool") || { echo "ERROR mise has no version of $tool set" >&2; exit 2; }
+    fi
+    # PATH names where the tool resolves when its directory is a link, since the
+    # link itself is not bound into the sandbox (below).
+    dir=$(dirname "$found")
+    [ -L "$dir" ] && dir=$(dirname "$(readlink -f "$found")")
+    path="$path$dir:"
+    # A tool under the home directory is hidden by the private home unless its
+    # directory, and the directory its link resolves to, are bound back read-only.
+    # A directory that is itself a link (mise's installs/TOOL/latest) cannot be a
+    # mount point; the directory it resolves to is bound instead.
+    for dir in "$(dirname "$found")" "$(dirname "$(readlink -f "$found")")"; do
+        case $dir in "$HOME"/*) [ -L "$dir" ] || tool_dirs+=("$dir") ;; esac
+    done
+    # A tool installed as a Node package (an ACP adapter) loads its dependencies
+    # from the node_modules tree it lives in, so that whole tree is bound too.
+    real=$(readlink -f "$found")
+    case $real in "$HOME"/*/node_modules/*) tool_dirs+=("${real%%/node_modules/*}/node_modules") ;; esac
+done
+path="$path/usr/local/bin:/usr/bin"
+
+env=(--clearenv --setenv HOME "$HOME" --setenv USER "$USER" --setenv PATH "$path"
+     --setenv LANG "${LANG:-C.UTF-8}" --setenv TERM "$([ "$login" = 1 ] && echo "${TERM:-xterm}" || echo dumb)" --setenv TMPDIR /tmp
+     --setenv RUSTUP_HOME "$HOME/.rustup" --setenv GOPATH "$HOME/go" --setenv GOFLAGS -modcacherw
+     --setenv npm_config_cache "$HOME/.npm"
+     --setenv GIT_AUTHOR_NAME "$(git -C "$repo" config user.name)"
+     --setenv GIT_AUTHOR_EMAIL "$(git -C "$repo" config user.email)"
+     --setenv GIT_COMMITTER_NAME "$(git -C "$repo" config user.name)"
+     --setenv GIT_COMMITTER_EMAIL "$(git -C "$repo" config user.email)"
+     --setenv GIT_OBJECT_DIRECTORY "$objects" --setenv GIT_ALTERNATE_OBJECT_DIRECTORIES "$common/objects"
+     --setenv GIT_CONFIG_COUNT 2
+     --setenv GIT_CONFIG_KEY_0 gc.auto --setenv GIT_CONFIG_VALUE_0 0
+     --setenv GIT_CONFIG_KEY_1 maintenance.auto --setenv GIT_CONFIG_VALUE_1 false)
+env+=("${acp_environment[@]}")
+[ -n "${AGENT_MODEL:-}" ] && env+=(--setenv AGENT_MODEL "$AGENT_MODEL")
+# The coordinator mounts shared runtime files explicitly. Keep their namespace
+# when a private worker starts with an otherwise cleared environment.
+if [ -n "$runtime_manifest" ] && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    env+=(--setenv XDG_RUNTIME_DIR "$XDG_RUNTIME_DIR")
+fi
+auth="$state/agent-auth.env"
+if [ "$login" = 0 ] && [ "$harness" != shell ] && [ "$harness" != agy ] && [ "$harness" != acp ]; then
+    # A session needs a login made with `login`, or a token in the env file.
+    # agy keeps its login in a keyring or a file of its choosing, so it is
+    # asked directly once the sandbox exists.
+    case $harness in
+        claude) signed_in=("$home_dir/.claude/.credentials.json") ;;
+        codex)  signed_in=("$home_dir/.codex/auth.json") ;;
+    esac
+    if [ ! -e "${signed_in[0]}" ] && ! { [ -f "$auth" ] && grep -q '^[A-Z_]*TOKEN=\|^[A-Z_]*KEY=' "$auth"; }; then
+        echo "ERROR $name is not signed in to $harness; run: tools/agent-loop $name $harness login" >&2
+        exit 2
+    fi
+fi
+if [ "$harness" = acp ] && [ -n "$acp_requirements" ]; then
+    python3 -I "$repo/tools/checks.py" managed-home "$home_dir" "$acp_requirements" >&2
+fi
+if [ "$harness" = codex ]; then
+    mkdir -p "$home_dir"
+    python3 -I "$repo/tools/checks.py" codex-home "$home_dir"
+fi
+if [ "$harness" != shell ] && [ "$harness" != acp ] && [ -f "$auth" ]; then
+    [ "$(stat -c %a "$auth")" = 600 ] || { echo "ERROR $auth must be mode 600" >&2; exit 2; }
+    while IFS= read -r line || [ -n "$line" ]; do
+        case $line in ''|'#'*) continue ;; esac
+        key=${line%%=*}
+        case $key in *[!A-Za-z0-9_]*|'') echo "ERROR bad line in $auth" >&2; exit 2 ;; esac
+        env+=(--setenv "$key" "${line#*=}")
+    done <"$auth"
+fi
+
+ro_if() { [ -e "$1" ] && sandbox+=(--ro-bind "$1" "$1"); return 0; }
+# A login needs the terminal, so only it keeps the controlling terminal.
+session_flag=(--new-session)
+[ "$login" = 1 ] && session_flag=()
+sandbox=(bwrap --unshare-pid --unshare-ipc "${session_flag[@]}" --die-with-parent
+         --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/bin /sbin
+         --symlink usr/lib /lib --symlink usr/lib /lib64
+         --ro-bind /etc /etc --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run)
+ro_if /opt
+ro_if /run/systemd/resolve
+sandbox+=(--bind "$home_dir" "$HOME")
+ro_if "$HOME/.rustup"
+ro_if "$HOME/.cargo/bin"
+ro_if "$HOME/.local/share/mise/installs"
+ro_if "$HOME/.local/share/uv/python"
+ro_if "$data"
+sandbox+=(--bind "$private/cargo-registry" "$HOME/.cargo/registry"
+          --bind "$private/cargo-git" "$HOME/.cargo/git"
+          --bind "$private/uv-cache" "$HOME/.cache/uv"
+          --bind "$private/go" "$HOME/go"
+          --bind "$private/go-build" "$HOME/.cache/go-build"
+          --bind "$private/npm" "$HOME/.npm")
+# Tool directories go on top of the caches, so a tool under ~/go/bin, say,
+# stays the host's read-only copy.
+for dir in "${tool_dirs[@]}"; do ro_if "$dir"; done
+# Arivu supplies only the context and hook runtime its managed profile needs
+# (Codex's requirements, or the shell prefix and hooks of Claude Code's managed
+# settings). The manifest belongs to the coordinator, outside the home/tree.
+if [ -n "$runtime_manifest" ]; then
+    runtime=$(python3 -I "$repo/tools/checks.py" runtime-mounts "$runtime_manifest" "$home_dir") || exit 2
+    if [ -n "$runtime" ]; then
+        mapfile -t runtime_args <<<"$runtime"
+        sandbox+=("${runtime_args[@]}")
+    fi
+fi
+# The .git directory is an overlay: what the agent's git writes outside the
+# binds below (packed-refs.lock, main's index, a hook or config of its own)
+# lands in a tmpfs that disappears with the sandbox. Its object store's info/
+# is read-only, so the store cannot point the host's copy at other stores.
+if [ "$harness" = acp ] && [ -n "$acp_socket" ]; then
+    sandbox+=(--bind "$acp_socket" "$acp_socket"
+               --ro-bind "$repo/tools/agent-context.py" /tmp/agent-context.py)
+    cmd=(python3 -I /tmp/agent-context.py "$acp_socket" "$acp_run_id" "$acp_runtime_root" "${cmd[@]}")
+fi
+base=("${sandbox[@]}")
+sandbox+=(--overlay-src "$common" --tmp-overlay "$common"
+          --bind "$saved_refs" "$common/refs/arivu"
+          --bind "$objects" "$objects"
+          --ro-bind "$objects/info" "$objects/info"
+          --bind "$common/worktrees/$name" "$common/worktrees/$name"
+          --bind "$common/refs/heads/agent" "$common/refs/heads/agent"
+          --bind "$common/logs/refs/heads/agent" "$common/logs/refs/heads/agent"
+          --bind "$worktree" "$worktree"
+          --chdir "$worktree")
+sandbox+=("${env[@]}" --)
+if [ -n "${AGENT_PRINT_SANDBOX:-}" ]; then
+    # A launch diagnostic never prints explicitly referenced account values.
+    for ((acp_index=0; acp_index<${#sandbox[@]}; acp_index++)); do
+        if [ "${sandbox[acp_index]}" = --setenv ]; then
+            for ((acp_offset=0; acp_offset<${#acp_environment[@]}; acp_offset+=3)); do
+                if [ "${sandbox[acp_index+1]}" = "${acp_environment[acp_offset+1]}" ]; then
+                    sandbox[acp_index+2]='<environment reference>'
+                fi
+            done
+        fi
+    done
+    printf '%s\n' "${sandbox[@]}"
+    exit 0
+fi
+
+# `agy models` answers in a second, and only when signed in; an agy that is not
+# would otherwise wait for a browser sign-in that never comes. It runs in the
+# sandbox without the repository, before the worktree or branch exist.
+agy_signed_in() {
+    "${base[@]}" --chdir "$HOME" "${env[@]}" -- agy models >/dev/null 2>&1 </dev/null
+}
+mkdir -p "$home_dir" "$private/cargo-registry" "$private/cargo-git" "$private/uv-cache" \
+         "$private/go" "$private/go-build" "$private/npm"
+if [ "$harness" = agy ] && [ "$login" = 0 ] && ! agy_signed_in; then
+    echo "ERROR $name is not signed in to agy; run: tools/agent-loop $name agy login" >&2
+    exit 2
+fi
+
+if [ "$probe" = 1 ]; then
+    # The sandbox without the repository, as agy's sign-in check uses it. The
+    # coordinator's context proxy needs its host on the socket, so a probe's
+    # descriptor names none rather than leave it out unseen.
+    [ -z "$acp_socket" ] || { echo "ERROR a probe's ACP descriptor names no context socket" >&2; exit 2; }
+    exec "${base[@]}" --ro-bind "$repo/tools/acp-probe.py" /tmp/acp-probe.py --chdir /tmp "${env[@]}" -- \
+        python3 -I /tmp/acp-probe.py /tmp "${acp_cmd[@]}"
+fi
+
+# Nothing in the repository is created until every argument and file above has been checked.
+mkdir -p "$objects/pack" "$objects/info" "$saved_refs/saved"
+if [ ! -d "$worktree" ]; then
+    mkdir -p "$(dirname "$worktree")"
+    # A worktree directory removed by hand leaves its registration behind.
+    git -C "$repo" worktree prune
+    if git -C "$repo" rev-parse -q --verify "refs/heads/agent/$name" >/dev/null; then
+        # The checkout would run hooks from the agent's tree, so none run.
+        GIT_ALTERNATE_OBJECT_DIRECTORIES="$objects" git -C "$repo" -c core.hooksPath=/dev/null worktree add -q "$worktree" "agent/$name"
+    else
+        git -C "$repo" -c core.hooksPath=/dev/null worktree add -q -b "agent/$name" "$worktree" main
+    fi
+fi
+mkdir -p "$logs"
+mkdir -p "$common/refs/heads/agent" "$common/logs/refs/heads/agent"
+branch_tip() { git -C "$repo" rev-parse -q --verify "refs/heads/agent/$name" 2>/dev/null || echo none; }
+
+# Copy every object in the agent's store that the repository lacks into the
+# repository's store, through index-pack --strict, which checks each object
+# and its links. Host-side git reads the agent's store only as objects.
+import_objects() {
+    local missing
+    [ ! -e "$objects/info/alternates" ] || { echo "ERROR $objects/info/alternates exists; the agent's store must stand alone"; return 1; }
+    missing=$(GIT_OBJECT_DIRECTORY="$objects" GIT_ALTERNATE_OBJECT_DIRECTORIES='' git -C "$repo" cat-file --batch-all-objects --batch-check='%(objectname)' \
+        | GIT_OBJECT_DIRECTORY="$common/objects" GIT_ALTERNATE_OBJECT_DIRECTORIES='' git -C "$repo" cat-file --batch-check='%(objectname) %(objecttype)' | awk '$2 == "missing" { print $1 }')
+    if [ -n "$missing" ]; then
+        printf '%s\n' "$missing" | GIT_OBJECT_DIRECTORY="$common/objects" GIT_ALTERNATE_OBJECT_DIRECTORIES="$objects" git -C "$repo" pack-objects --quiet --stdout \
+        | GIT_OBJECT_DIRECTORY="$common/objects" GIT_ALTERNATE_OBJECT_DIRECTORIES='' git -C "$repo" index-pack --stdin --strict >/dev/null || return 1
+    fi
+    python3 -I "$repo/tools/checks.py" worker-saves "$repo" "$saved_refs" "$name"
+}
+
+if [ "$login" = 1 ]; then
+    echo "signing $name in to $harness inside its sandbox; open any URL it prints in your browser"
+    [ "$harness" != codex ] || echo "codex's device login must first be allowed in your ChatGPT account's security settings"
+    exec "${sandbox[@]}" "${cmd[@]}"
+fi
+
+
+# Keep ACP process shutdown and final object import tied to the transport owner.
+acp_pid=""
+acp_cleanup() {
+    if [ -n "$acp_pid" ]; then
+        local attempt
+        kill -TERM "$acp_pid" 2>/dev/null || true
+        attempt=0
+        while kill -0 "$acp_pid" 2>/dev/null && [ "$attempt" -lt 20 ]; do
+            sleep 0.1
+            attempt=$((attempt + 1))
+        done
+        kill -KILL "$acp_pid" 2>/dev/null || true
+        wait "$acp_pid" 2>/dev/null || true
+        import_objects >>"$logs/import.log" 2>&1 || true
+    fi
+}
+if [ "$harness" = acp ]; then
+    trap acp_cleanup EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+fi
+
+# Bring agent/$name up to main, in the sandbox. A landing squashes the branch's
+# commits into one on main, and replaying them against their own squash
+# conflicts, so the coordinator writes the head it landed to $private/landed and
+# only the commits after it are replayed. A failed rebase is aborted, so the
+# tree is never left halfway through one.
+rebase_onto_main() {
+    local landed
+    # Work a session left uncommitted (a stopped run resumed later) stays as it
+    # is: git refuses to rebase over it, and the rebase after the session, once
+    # it is committed, brings the branch up to main.
+    if [ -n "$("${sandbox[@]}" git status --porcelain --untracked-files=no 2>/dev/null </dev/null)" ]; then
+        echo "agent/$name has uncommitted changes; this session starts from its current base" >"$logs/rebase.log"
+        return 0
+    fi
+    landed=$(cat "$private/landed" 2>/dev/null || true)
+    if [[ $landed =~ ^[0-9a-f]{40}$ ]] &&
+        "${sandbox[@]}" git merge-base --is-ancestor "$landed" HEAD >/dev/null 2>&1 </dev/null; then
+        "${sandbox[@]}" git rebase -q --onto main "$landed" >"$logs/rebase.log" 2>&1 </dev/null && return 0
+    elif "${sandbox[@]}" git rebase -q main >"$logs/rebase.log" 2>&1 </dev/null; then
+        return 0
+    fi
+    "${sandbox[@]}" git rebase --abort >/dev/null 2>&1 </dev/null || true
+    return 1
+}
+
+failures=0
+for i in $(seq 1 "$sessions"); do
+    if ! rebase_onto_main; then
+        echo "ERROR rebase of agent/$name onto main failed in the sandbox; see $logs/rebase.log" >&2
+        exit 1
+    fi
+    import_objects >>"$logs/import.log" 2>&1 || { echo "ERROR copying the agent's objects failed; see $logs/import.log" >&2; exit 1; }
+    if [ "$harness" = agy ] && ! agy_signed_in; then
+        echo "ERROR $name's agy sign-in lapsed before session $i; run: tools/agent-loop $name agy login" >&2
+        exit 2
+    fi
+    if [ "${#tasks[@]}" -gt 0 ]; then
+        harness_cmd "$prompt
+
+The coordinator approved task ${tasks[i-1]} for this session: take that task, and do not choose another."
+    fi
+    log="$logs/$(date +%Y%m%d-%H%M%S-%N).jsonl"
+    session_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    session_tip=$(branch_tip)
+    if [ "$harness" = acp ]; then
+        echo "session $i of $sessions: $log" >&2
+        python3 -I "$repo/tools/checks.py" acp-provenance "$AGENT_ACP_CONFIG" "$private/sessions.jsonl" "$name" "agent/$name" "$session_at" "$session_tip"
+    else
+        echo "session $i of $sessions: $log"
+    fi
+    # Written before the session starts, so a session that is killed still
+    # counts as an author of the branch.
+    [ "$harness" = shell ] || echo "$session_at $harness $session_tip" >>"$private/sessions.log"
+    if [ "$harness" = acp ]; then
+        # Bash otherwise redirects asynchronous command stdin to /dev/null.
+        exec {acp_input}<&0
+        "${sandbox[@]}" "${cmd[@]}" <&"$acp_input" &
+        exec {acp_input}<&-
+    else
+        "${sandbox[@]}" "${cmd[@]}" >"$log" 2>&1 </dev/null &
+    fi
+    pid=$!
+    [ "$harness" != acp ] || acp_pid=$pid
+    while kill -0 "$pid" 2>/dev/null; do
+        import_objects >>"$logs/import.log" 2>&1 || true
+        sleep 2
+    done
+    status=0
+    wait "$pid" || status=$?
+    acp_pid=""
+    if ! import_objects >>"$logs/import.log" 2>&1; then
+        echo "ERROR copying the agent's objects failed; see $logs/import.log" >&2
+        status=1
+    fi
+    # A bound session moves only its own task, judged on the commits it made: an
+    # earlier session's unlanded commit (a task it blocked, say) stays on the
+    # branch and is not this one's. The objects are imported and checked above,
+    # so host git reads them safely.
+    if [ "$status" -eq 0 ] && [ "${#tasks[@]}" -gt 0 ]; then
+        allowed=" ${tasks[i-1]} "
+        since=$session_tip
+        [ "$since" != none ] || since=main
+        while IFS= read -r moved; do
+            number=${moved#tasks/}
+            number=${number:0:4}
+            case $allowed in *" $number "*) ;; *)
+                echo "ERROR session $i changed $moved, outside its tasks (${tasks[i-1]})" >&2
+                status=1 ;;
+            esac
+        done < <(git -C "$repo" diff --name-only "$since" "refs/heads/agent/$name" -- tasks/ ':!tasks/README.md')
+    fi
+    if [ "$status" -ne 0 ]; then
+        echo "ERROR session $i failed; see $log" >&2
+        failures=$((failures + 1))
+    fi
+done
+# Main may have moved while the sessions ran (another landing); bring the branch
+# up to it, so the land check that follows sees current main. A rebase that does
+# not apply cleanly leaves the branch as the sessions left it, and says so.
+if ! rebase_onto_main; then
+    echo "WARN agent/$name does not rebase cleanly onto the main that moved during its sessions; see $logs/rebase.log" >&2
+fi
+import_objects >>"$logs/import.log" 2>&1 || { echo "ERROR copying the agent's objects failed; see $logs/import.log" >&2; exit 1; }
+[ "$failures" -eq 0 ] || { echo "ERROR $failures of $sessions sessions failed" >&2; exit 1; }
