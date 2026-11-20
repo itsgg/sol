@@ -7,7 +7,7 @@ Goal: a prompt or fast-list change is measured, not judged by eye: tests/live/ev
 
 Acceptance:
 - run: `python3 -I -c "import ast,sys; ast.parse(open('tests/live/eval.py').read())"`
-- run: `test "$(./sol --version)" = 0.2.0`
+- run: `./sol --version | grep -Eq '^(0\.([2-9]|[1-9][0-9])|[1-9])'`
 - GG or the coordinator runs `tests/live/eval.py` and records the score here.
 
 ## Log
@@ -15,3 +15,4 @@ Acceptance:
 - 2026-11-20: created.
 - 2026-11-20: built. Score 33/33 (eleven requests, three runs, slowest 1.4 s). Against a stub that always answers `ls -la` the same eval scores 0/11, so the patterns reject a wrong command.
 - 2026-11-20: landed; done.
+- 2026-11-20: the version check now asks for 0.2.0 or later; pinned to 0.2.0 it failed the gate once sol moved to 0.3.0.
