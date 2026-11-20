@@ -141,7 +141,8 @@ sol_clean() {
         line="${line%"${line##*[![:space:]]}"}"
         [[ -z $line || $line == \#* ]] && continue
         [[ $line == '$ '* ]] && line=${line#'$ '}
-        if [[ $line == \`*\` && ${#line} -ge 2 ]]; then
+        # A line wrapped in backticks and holding no others, as in `ls -lS`.
+        if [[ $line == \`*\` && ${#line} -ge 2 && ${line:1:${#line}-2} != *\`* ]]; then
             line=${line#\`}
             line=${line%\`}
         fi
@@ -181,7 +182,7 @@ __sol_widget() {
     command=\$(SOL_HISTORY="\$(HISTTIMEFORMAT= history $HISTORY_LINES)" SOL_CWD="\$PWD" SOL_SHELL="bash \${BASH_VERSION%%[^0-9.]*}" $(printf '%q' "$self") -- "\$request") || return 0
     [[ -n \$command ]] || return 0
     READLINE_LINE=\$command
-    local LC_ALL=C
+    # bash 5 counts READLINE_POINT in characters, as \${#} does in a UTF-8 locale.
     READLINE_POINT=\${#READLINE_LINE}
 }
 bind -x '"\C-g": __sol_widget'

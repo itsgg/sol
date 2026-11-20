@@ -91,6 +91,7 @@ def run(answer, status, keys, expect, name, history=None):
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": work,
             "TERM": "dumb",
+            "LANG": "C.UTF-8",
             "INPUTRC": "/dev/null",
             "SOL_VAZHI": os.path.join(work, "vazhi"),
             "STUB_DIR": work,
@@ -125,6 +126,9 @@ system = args[3].decode() if len(args) > 3 else ""
 # The latest command too: inside bind -x, fc -l would leave it out.
 check("REQ-WIDGET-02 history reaches sol, latest included, numbers stripped",
       "\n  true first-command\n  echo 'two lines'\n  true latest-command" in system, system)
+
+# REQ-WIDGET-02: a command with non-ASCII text still leaves the cursor at its end.
+run("echo h\u00e9llo", 0, "say hello\x07", "echo h\u00e9llo", "REQ-WIDGET-02 cursor at the end of a UTF-8 command")
 
 # REQ-WIDGET-03: when no model answers, the request stays on the line unchanged.
 run("", 1, "list files by size\x07", "list files by size", "REQ-WIDGET-03 failure leaves the line")

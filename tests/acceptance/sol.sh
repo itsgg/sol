@@ -112,21 +112,22 @@ else
     fail "REQ-CTX-01 numbered history got: $prompt"
 fi
 
-# REQ-CTX-02: history lines that look like secrets never reach vazhi; ordinary ones do.
-history="$(cat "$root/spec/cases/secret/drop.txt" "$root/spec/cases/secret/keep.txt")"
-rm -f "$work/args"
-STUB_ANSWER=ls SOL_HISTORY=$history "$sol" -- list >/dev/null
-stub_args
-system=${args[3]}
-leaked=0
-while IFS= read -r line; do
-    [[ -n $line && $system == *"$line"* ]] && { fail "REQ-CTX-02 leaked: $line"; leaked=1; }
-done <"$root/spec/cases/secret/drop.txt"
-kept=1
-while IFS= read -r line; do
-    [[ $system == *"  $line"* ]] || { fail "REQ-CTX-02 dropped a safe line: $line"; kept=0; }
+# REQ-CTX-02: history lines that look like secrets never reach vazhi; ordinary ones do. Each
+# safe line is sent alone after every secret line, so the case files can grow freely.
+drop=$(cat "$root/spec/cases/secret/drop.txt")
+ctx02=1
+while IFS= read -r safe; do
+    [[ -n $safe ]] || continue
+    rm -f "$work/args"
+    STUB_ANSWER=ls SOL_HISTORY="$drop"$'\n'"$safe" "$sol" -- list >/dev/null
+    stub_args
+    system=${args[3]}
+    [[ $system == *$'oldest first:\n  '"$safe"* ]] || { fail "REQ-CTX-02 dropped a safe line: $safe"; ctx02=0; }
+    while IFS= read -r line; do
+        [[ -n $line && $system == *"$line"* ]] && { fail "REQ-CTX-02 leaked: $line"; ctx02=0; }
+    done <<<"$drop"
 done <"$root/spec/cases/secret/keep.txt"
-((leaked == 0 && kept == 1)) && pass "REQ-CTX-02 secret lines dropped, others kept"
+((ctx02)) && pass "REQ-CTX-02 secret lines dropped, others kept"
 
 # REQ-WIDGET-01: the widget code parses and binds Ctrl+G to __sol_widget.
 init=$("$sol" --init bash)

@@ -70,7 +70,7 @@ Acceptance: `tests/acceptance/sol.sh` (REQ-CMD-04).
 ### 6.2 Cleaning
 
 ### REQ-CLEAN-01: One command line from an answer
-When `sol --clean` reads an answer, the system shall: drop carriage returns; when the answer holds a fenced block, keep only the first block's lines; trim each line; drop blank lines and lines starting with `#`; remove a leading `$ ` and a surrounding pair of backticks; then join the lines, with a space after a line ending in `\` (the backslash removed), `|`, `&&` or `||`, and with ` && ` otherwise.
+When `sol --clean` reads an answer, the system shall: drop carriage returns; when the answer holds a fenced block, keep only the first block's lines; trim each line; drop blank lines and lines starting with `#`; remove a leading `$ `, and a pair of backticks around a line that holds no other backtick; then join the lines, with a space after a line ending in `\` (the backslash removed), `|`, `&&` or `||`, and with ` && ` otherwise.
 Acceptance: every `spec/cases/clean/NN-name.in` cleans to its `.out` (`tests/acceptance/sol.sh`, REQ-CLEAN-01).
 
 ### 6.3 Context
@@ -142,6 +142,7 @@ Beyond `tools/protected.txt` (which covers `tests/acceptance/**` and `spec/cases
 ## 13. Changes and retired requirements
 
 - 2026-11-20: created.
+- 2026-11-20: change 0001 merged: REQ-CLEAN-01 keeps backticks inside a line.
 
 ### Retired
 
