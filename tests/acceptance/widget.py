@@ -130,6 +130,9 @@ check("REQ-WIDGET-02 history reaches sol, latest included, numbers stripped",
 # REQ-WIDGET-02: a command with non-ASCII text still leaves the cursor at its end.
 run("echo h\u00e9llo", 0, "say hello\x07", "echo h\u00e9llo", "REQ-WIDGET-02 cursor at the end of a UTF-8 command")
 
+# REQ-WIDGET-02: the widget sends the shell's aliases, so an aliased ls runs as the original.
+run("ls -lt", 0, "list newest\x07", "command ls -lt", "REQ-WIDGET-02 aliases reach sol", history=["alias ls='echo'"])
+
 # REQ-WIDGET-03: when no model answers, the request stays on the line unchanged.
 run("", 1, "list files by size\x07", "list files by size", "REQ-WIDGET-03 failure leaves the line")
 

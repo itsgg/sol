@@ -39,11 +39,12 @@ Dependencies: bash 5 (READLINE_LINE and READLINE_POINT for `bind -x`, SEED R6), 
 System: <PRETTY_NAME from os-release>[ (based on <ID_LIKE>)]
 Shell: <SOL_SHELL, or "bash" and the running version>
 Current directory: <SOL_CWD, or $PWD>
+Directories here: <names>
 Recent commands, oldest first:
   <command>
 ```
 
-The last two parts appear only when a command survives the secret filter. Without os-release, the system is `uname -s`.
+The directories line appears only when there are directories (REQ-CTX-03); the last two parts only when a command survives the secret filter. Without os-release, the system is `uname -s`.
 
 - Invariant: `sol` prints at most one line on stdout, and only on exit status 0.
 
@@ -54,6 +55,10 @@ The last two parts appear only when a command survives the secret filter. Withou
 ### REQ-CMD-01: Ask vazhi and print the command
 When `sol [--] REQUEST...` runs, the system shall call `$SOL_VAZHI` (default `vazhi`) as `ask --fast --system <prompt> -- <request>`, clean its answer by section 6.2, print the command and exit 0.
 Acceptance: `tests/acceptance/sol.sh` (REQ-CMD-01): a request starting with `--` reaches the stub after `--`, and a fenced answer prints as `ls -lS`.
+
+### REQ-CMD-05: Aliased commands run as the original
+When the command has a command word, at its start or after `|`, `;`, `&`, `(` or a backtick, that names an alias in SOL_ALIASES which replaces a command on PATH, the system shall print that word as `command <name>`; it shall send no alias value to vazhi.
+Acceptance: every line of `spec/cases/unalias/cases.tsv` (answer, then expected command, tab-separated) with aliases ls (replacing a command) and g (not), and the prompt holds no alias value (`tests/acceptance/sol.sh`, REQ-CMD-05).
 
 ### REQ-CMD-02: Bad usage
 If `sol` gets no request, a blank request, or `--init` with anything but `bash`, then it shall print usage to stderr and exit 2.
@@ -79,6 +84,10 @@ Acceptance: every `spec/cases/clean/NN-name.in` cleans to its `.out` (`tests/acc
 When `sol` builds its prompt, the system shall write the context block of section 5 with at most the last five commands from SOL_HISTORY, numbers stripped and a multi-line command joined with spaces.
 Acceptance: `tests/acceptance/sol.sh` (REQ-CTX-01), through `sol --dry-run`, which prints the prompt and the request and calls nothing.
 
+### REQ-CTX-03: Directory names
+When the current directory holds directories that are not hidden, the system shall add `Directories here: <names>` (up to 40, space-separated) to the context block, after the current directory.
+Acceptance: `tests/acceptance/sol.sh` (REQ-CTX-03).
+
 ### REQ-CTX-02: No secrets in the context
 If a command in SOL_HISTORY contains, in any case, `key`, `token`, `secret`, `passw`, `passphrase`, `credential`, `bearer`, `authorization`, `auth=`, `cookie` or `private`, or a run of 24 or more characters from `A-Za-z0-9_+=-` holding both a letter and a digit, then the system shall leave that command out of the prompt.
 Acceptance: no line of `spec/cases/secret/drop.txt` and every line of `keep.txt` reaches vazhi as sent (`tests/acceptance/sol.sh`, REQ-CTX-02).
@@ -90,8 +99,8 @@ When `sol --init bash` runs, the system shall print bash code that parses and bi
 Acceptance: `tests/acceptance/sol.sh` (REQ-WIDGET-01).
 
 ### REQ-WIDGET-02: Ctrl+G replaces the line
-While bash is reading a line, when Ctrl+G is pressed on a non-blank line, the widget shall call `sol` with the line, `history 5` output (HISTTIMEFORMAT empty), `$PWD` and the bash version, and on exit 0 set READLINE_LINE to the command and READLINE_POINT to its end, running nothing.
-Acceptance: `tests/acceptance/widget.py` (REQ-WIDGET-02) in an interactive bash on a pty: the line becomes the command, typing continues at its end, and the latest command before it reaches `sol`.
+While bash is reading a line, when Ctrl+G is pressed on a non-blank line, the widget shall call `sol` with the line, `alias` output, `history 5` output (HISTTIMEFORMAT empty), `$PWD` and the bash version, and on exit 0 set READLINE_LINE to the command and READLINE_POINT to its end, running nothing.
+Acceptance: `tests/acceptance/widget.py` (REQ-WIDGET-02) in an interactive bash on a pty: the line becomes the command, typing continues at its end, and the latest command before it reaches `sol`, and an alias defined in the shell makes `ls` come back as `command ls`.
 
 ### REQ-WIDGET-03: Failure keeps the line
 If `sol` exits non-zero or prints nothing, then the widget shall leave READLINE_LINE and READLINE_POINT as they were.
@@ -111,7 +120,7 @@ sol --init bash            print the widget
 sol --help | --version
 ```
 
-Environment: SOL_HISTORY, SOL_CWD, SOL_SHELL (section 5), SOL_VAZHI (the vazhi command), SOL_OS_RELEASE (the os-release file; for tests).
+Environment: SOL_HISTORY, SOL_CWD, SOL_SHELL (section 5), SOL_ALIASES (`alias` output; only names are used), SOL_VAZHI (the vazhi command), SOL_OS_RELEASE (the os-release file; for tests).
 
 Exit status: 0 printed a command; 1 no answer; 2 bad usage; 3 the answer held no command. Stdout carries only the command; every message goes to stderr, one line, starting `sol:`.
 
@@ -143,6 +152,7 @@ Beyond `tools/protected.txt` (which covers `tests/acceptance/**` and `spec/cases
 
 - 2026-11-20: created.
 - 2026-11-20: change 0001 merged: REQ-CLEAN-01 keeps backticks inside a line.
+- 2026-11-20: change 0002 merged: REQ-CMD-05 and REQ-CTX-03 added, REQ-WIDGET-02 sends aliases.
 
 ### Retired
 

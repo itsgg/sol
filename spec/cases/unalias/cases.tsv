@@ -1,0 +1,8 @@
+ls -lt | tail -1	command ls -lt | tail -1
+ls -S	command ls -S
+cat x && ls -S; (ls -a)	cat x && command ls -S; (command ls -a)
+find . -name x | xargs ls -l	find . -name x | xargs ls -l
+command ls -lt	command ls -lt
+lsblk -f	lsblk -f
+echo ls	echo ls
+g status	g status

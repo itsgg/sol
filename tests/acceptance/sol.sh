@@ -129,6 +129,34 @@ while IFS= read -r safe; do
 done <"$root/spec/cases/secret/keep.txt"
 ((ctx02)) && pass "REQ-CTX-02 secret lines dropped, others kept"
 
+# REQ-CMD-05: a command word that an alias replaces runs as `command <name>`; other words,
+# shortcuts (g) and quoted uses stay. Aliases: ls replaces a command, g does not.
+aliases=$'alias ls=\'eza -lh --token-ABC123\'\nalias g=\'git\''
+while IFS=$'\t' read -r input want; do
+    got=$(STUB_ANSWER=$input SOL_ALIASES=$aliases "$sol" -- x)
+    if [[ $got == "$want" ]]; then pass "REQ-CMD-05 [$input]"; else fail "REQ-CMD-05 [$input]: got [$got] want [$want]"; fi
+done <"$root/spec/cases/unalias/cases.tsv"
+rm -f "$work/args"
+STUB_ANSWER=ls SOL_ALIASES=$aliases "$sol" -- x >/dev/null
+stub_args
+if [[ ${args[3]} != *eza* && ${args[3]} != *token-ABC123* ]]; then
+    pass "REQ-CMD-05 alias values never reach vazhi"
+else
+    fail "REQ-CMD-05 alias value sent: ${args[3]}"
+fi
+
+# REQ-CTX-03: the directories in the current directory, not hidden ones or files, are named.
+mkdir -p "$work/here/Downloads" "$work/here/src" "$work/here/.cache"
+: >"$work/here/notes.txt"
+prompt=$(SOL_CWD=$work/here "$sol" --dry-run x)
+if [[ $prompt == *$'\nDirectories here: Downloads src\n'* ]]; then
+    pass "REQ-CTX-03 directory names"
+else
+    fail "REQ-CTX-03 got: $prompt"
+fi
+prompt=$(SOL_CWD=$work/here/src "$sol" --dry-run x)
+if [[ $prompt != *"Directories here"* ]]; then pass "REQ-CTX-03 no line without directories"; else fail "REQ-CTX-03 empty: $prompt"; fi
+
 # REQ-WIDGET-01: the widget code parses and binds Ctrl+G to __sol_widget.
 init=$("$sol" --init bash)
 if bash -n <<<"$init" && [[ $init == *"bind -x '\"\\C-g\": __sol_widget'"* ]]; then

@@ -13,7 +13,8 @@ usage: sol [--] REQUEST...      print one command line for REQUEST
        sol --dry-run REQUEST... print what would be sent to vazhi, and send nothing
        sol --clean              clean a model's answer on standard input to one command line
 
-Context comes from SOL_HISTORY (recent commands: `history N` output, or one per line), SOL_CWD (default: the
+Context comes from SOL_HISTORY (recent commands: `history N` output, or one per line), SOL_ALIASES
+(`alias` output), SOL_CWD (default: the
 current directory) and SOL_SHELL (default: bash and its version). SOL_VAZHI names the
 vazhi command (default: vazhi).
 
@@ -95,9 +96,51 @@ sol_history() {
     done
 }
 
+# The names in SOL_ALIASES (`alias` output) that replace a command on PATH, such as ls when it
+# runs eza. Shortcuts like g='git' replace nothing. Only names are used; values never leave.
+sol_alias_names() {
+    local line
+    while IFS= read -r line; do
+        [[ $line =~ ^alias\ ([A-Za-z0-9_.+-]+)= ]] || continue
+        type -P -- "${BASH_REMATCH[1]}" >/dev/null 2>&1 && printf '%s\n' "${BASH_REMATCH[1]}"
+    done <<<"${SOL_ALIASES:-}"
+}
+
+# Models write the original program's flags, so a command word an alias replaces is run as
+# `command <name>`: at the start and after |, ;, &, ( or `. Quoted text is not parsed.
+sol_unalias() {
+    local cmd=$1 name re
+    while IFS= read -r name; do
+        [[ -n $name ]] || continue
+        re="(^|[|;&(\`][[:space:]]*)${name//./\\.}([[:space:]]|$)"
+        local out="" rest=$cmd
+        while [[ $rest =~ $re ]]; do
+            local before=${rest%%"${BASH_REMATCH[0]}"*}
+            out+="$before${BASH_REMATCH[1]}command $name${BASH_REMATCH[2]}"
+            rest=${rest#*"${BASH_REMATCH[0]}"}
+        done
+        cmd=$out$rest
+    done < <(sol_alias_names)
+    printf '%s\n' "$cmd"
+}
+
+# Up to 40 directory names in the current directory, not hidden, so paths are spelled right.
+sol_dirs() {
+    local cwd=${SOL_CWD:-$PWD} d names=() 
+    for d in "$cwd"/*/; do
+        [[ -d $d ]] || continue
+        d=${d%/}
+        names+=("${d##*/}")
+        ((${#names[@]} >= 40)) && break
+    done
+    local IFS=" "
+    printf '%s\n' "${names[*]}"
+}
+
 sol_system_prompt() {
-    local shell=${SOL_SHELL:-bash ${BASH_VERSION%%[^0-9.]*}} cwd=${SOL_CWD:-$PWD} history
+    local shell=${SOL_SHELL:-bash ${BASH_VERSION%%[^0-9.]*}} cwd=${SOL_CWD:-$PWD} history dirs line
     history=$(sol_history)
+    dirs=$(sol_dirs)
     cat <<EOF
 You turn a request typed at a shell prompt into one command line for that shell.
 Reply with the command line only: no explanation, no code fence, no comments, no leading \$.
@@ -106,11 +149,13 @@ If the request is already a command, return it corrected, or unchanged when it i
 When the command needs a value the request does not give, write it as <name> for the user to fill in.
 Use the tools that come with the system below, or those the request names. Add sudo only when the task needs root.
 The current directory is the one below: use relative paths for things in it and ~ for the home directory.
+When the request names files by type or pattern without saying where, search the current directory and below with find.
 
 System: $(sol_os)
 Shell: $shell
 Current directory: $cwd
 EOF
+    [[ -n $dirs ]] && printf 'Directories here: %s\n' "$dirs"
     if [[ -n $history ]]; then
         printf 'Recent commands, oldest first:\n'
         while IFS= read -r line; do printf '  %s\n' "$line"; done <<<"$history"
@@ -179,7 +224,7 @@ __sol_widget() {
     local request=\$READLINE_LINE command
     [[ -n \${request//[[:space:]]/} ]] || return 0
     # history, not fc: inside bind -x, fc -l leaves out the latest command.
-    command=\$(SOL_HISTORY="\$(HISTTIMEFORMAT= history $HISTORY_LINES)" SOL_CWD="\$PWD" SOL_SHELL="bash \${BASH_VERSION%%[^0-9.]*}" $(printf '%q' "$self") -- "\$request") || return 0
+    command=\$(SOL_ALIASES="\$(alias)" SOL_HISTORY="\$(HISTTIMEFORMAT= history $HISTORY_LINES)" SOL_CWD="\$PWD" SOL_SHELL="bash \${BASH_VERSION%%[^0-9.]*}" $(printf '%q' "$self") -- "\$request") || return 0
     [[ -n \$command ]] || return 0
     READLINE_LINE=\$command
     # bash 5 counts READLINE_POINT in characters, as \${#} does in a UTF-8 locale.
@@ -233,10 +278,12 @@ main() {
         ((status == 127)) && echo "sol: vazhi not found; install it or set SOL_VAZHI" >&2
         return 1
     }
-    printf '%s\n' "$answer" | sol_clean || {
+    local command
+    command=$(printf '%s\n' "$answer" | sol_clean) || {
         echo "sol: the answer held no command" >&2
         return 3
     }
+    sol_unalias "$command"
 }
 
 main "$@"
