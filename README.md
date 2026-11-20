@@ -13,15 +13,19 @@ Sol is Tamil for "say".
 
 ## Install
 
-Sol needs bash 5 and vazhi 0.2 or later (`npm install -g @itsgg/vazhi`; keys as in vazhi's README, Groq's free key for the fastest answers).
+Sol needs bash 5 or zsh 5, and vazhi 0.2 or later (`npm install -g @itsgg/vazhi`; keys as in vazhi's README, Groq's free key for the fastest answers).
 
 ```bash
 git clone https://github.com/itsgg/sol ~/.local/share/sol-src
 ln -s ~/.local/share/sol-src/sol ~/.local/bin/sol
 echo 'command -v sol >/dev/null && eval "$(sol --init bash)"' >> ~/.bashrc
+# or, for zsh:
+echo 'command -v sol >/dev/null && eval "$(sol --init zsh)"' >> ~/.zshrc
 ```
 
-Ctrl+G replaces readline's default abort binding.
+The script itself needs bash 4 or later; on macOS, `brew install bash`.
+
+Ctrl+G replaces the default abort binding of readline and of zsh's line editor.
 
 ## Use
 

@@ -62,7 +62,7 @@ None. A personal tool, public under MIT so others can read and use it. No users 
 
 First release: bash only, the Ctrl+G widget, `sol` printing one command, context of OS, shell, current directory and the last five history lines, installed on GG's machine with a `~/.local/bin` wrapper and a line in `~/.bashrc`.
 
-Deferred: zsh and fish widgets, multi-line scripts, explanations, a confirmation step for dangerous commands, offline fallback.
+Deferred: a fish widget, multi-line scripts, explanations, a confirmation step for dangerous commands, offline fallback.
 
 Reference cases: `spec/cases/clean/` holds model outputs and the command line Sol must make of each (written by hand from the formats seen on 2026-11-20: fences, `$ ` prompts, comments, several lines). `spec/cases/requests.txt` holds reference requests for the live, ungated check.
 
@@ -89,9 +89,11 @@ Decisions:
 - D3. Context includes recent history, filtered for secrets (GG, 2026-11-20).
 - D4. Written in bash, one script plus the widget it prints; tests in bash with a stub `vazhi`. Product proposal: the work is reading a line, building a prompt and cleaning text, and a node or python process would double the start-up cost P2 counts.
 
+- D5. A zsh widget beside the bash one, and a plain refusal on bash older than 4 (GG, 2026-11-20, "fix those in order" after the review of what is specific to his machine).
+
 Open:
 
-- O1. zsh and fish widgets. Next action: none until GG uses another shell. Default: bash only.
+- O1. zsh and fish widgets. zsh settled 2026-11-20: GG asked for Sol to be usable beyond his machine, and zsh is the common second shell (D5). fish stays open; next action: none until someone asks.
 
 Working choices at creation, open to GG's change: name Sol (Tamil "say", "word"); repository itsgg/sol, public, MIT.
 

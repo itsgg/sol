@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests of record for the Ctrl+G widget in a real interactive bash on a pty (SPEC.md 6.3).
+"""Tests of record for the Ctrl+G widget in a real interactive bash and zsh on a pty (SPEC.md 6.4).
 
 vazhi is a stub, so nothing touches the network. Each test types a request, presses Ctrl+G,
 then types more and checks what the line became by echoing it, which also shows nothing ran
@@ -26,13 +26,18 @@ printf '%s' "$STUB_ANSWER"
 
 
 class Shell:
-    def __init__(self, work, env):
+    def __init__(self, shell, env):
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
-            os.execve("/bin/bash", ["bash", "--norc", "--noprofile", "-i"], env)
+            if shell == "bash":
+                os.execve(shutil.which("bash"), ["bash", "--norc", "--noprofile", "-i"], env)
+            os.execve(shutil.which("zsh"), ["zsh", "-f", "-i"], env)
         self.buf = b""
-        self.command(f"PS1='{MARK} '; HISTFILE=; set -o history")
-        self.command(f'eval "$({SOL} --init bash)"')
+        if shell == "bash":
+            self.command(f"PS1='{MARK} '; HISTFILE=; set -o history")
+        else:
+            self.command(f"PROMPT='{MARK} '; unsetopt PROMPT_SP; HISTSIZE=50")
+        self.command(f'eval "$({SOL} --init {shell})"')
 
     def command(self, line):
         """Run one line and wait for the next prompt: readline flushes input typed ahead of it."""
@@ -79,7 +84,7 @@ def check(name, ok, detail=""):
     failures += 0 if ok else 1
 
 
-def run(answer, status, keys, expect, name, history=None):
+def run(shell, answer, status, keys, expect, name, history=None):
     """Type keys in a fresh shell (Ctrl+G is \\x07); after them type ' Z', go to the start,
     insert 'echo ' and press Enter, so the output is the final line."""
     work = tempfile.mkdtemp()
@@ -98,7 +103,7 @@ def run(answer, status, keys, expect, name, history=None):
             "STUB_ANSWER": answer,
             "STUB_STATUS": str(status),
         }
-        sh = Shell(work, env)
+        sh = Shell(shell, env)
         for line in history or []:
             sh.command(line)
         sh.buf = b""
@@ -111,34 +116,48 @@ def run(answer, status, keys, expect, name, history=None):
         args = open(os.path.join(work, "args"), "rb").read().split(b"\0") if called else []
         output = sh.buf.decode(errors="replace")
         sh.close()
-        check(name, got, f"wanted {needle!r} in output: {output!r}")
+        check(f"{name} ({shell})", got, f"wanted {needle!r} in output: {output!r}")
         return called, args
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-# REQ-WIDGET-02: Ctrl+G puts the command on the line with the cursor at its end, runs nothing,
-# and sends recent history as context.
-called, args = run("```bash\nls -lS\n```", 0, "list files by size\x07", "ls -lS",
-                   "REQ-WIDGET-02 line becomes the command, cursor at the end",
-                   history=["true first-command", "echo 'two\nlines'", "true latest-command"])
+if not shutil.which("zsh"):
+    check("zsh is installed for the zsh widget tests", False, "install zsh")
+
+for shell in ("bash", "zsh"):
+    if not shutil.which(shell):
+        continue
+    # REQ-WIDGET-02 (bash), REQ-WIDGET-05 (zsh): Ctrl+G puts the command on the line with the
+    # cursor at its end, runs nothing, and sends recent history as context.
+    called, args = run(shell, "```bash\nls -lS\n```", 0, "list files by size\x07", "ls -lS",
+                       "REQ-WIDGET-02 REQ-WIDGET-05 line becomes the command, cursor at the end",
+                       history=["true first-command", "true middle-command", "true latest-command"])
+    system = args[3].decode() if len(args) > 3 else ""
+    # The latest command too: inside bash's bind -x, fc -l would leave it out.
+    check(f"REQ-WIDGET-02 REQ-WIDGET-05 history reaches sol, latest included ({shell})",
+          "\n  true first-command\n  true middle-command\n  true latest-command" in system, system)
+
+    # A command with non-ASCII text still leaves the cursor at its end.
+    run(shell, "echo h\u00e9llo", 0, "say hello\x07", "echo h\u00e9llo",
+        "REQ-WIDGET-02 REQ-WIDGET-05 cursor at the end of a UTF-8 command")
+
+    # The widget sends the shell's aliases, so an aliased ls runs as the original.
+    run(shell, "ls -lt", 0, "list newest\x07", "command ls -lt",
+        "REQ-WIDGET-02 REQ-WIDGET-05 aliases reach sol", history=["alias ls='echo'"])
+
+    # REQ-WIDGET-03: when no model answers, the request stays on the line unchanged.
+    run(shell, "", 1, "list files by size\x07", "list files by size", "REQ-WIDGET-03 failure leaves the line")
+
+    # REQ-WIDGET-04: Ctrl+G on a blank line asks nothing.
+    called, _ = run(shell, "ls", 0, "   \x07", "", "REQ-WIDGET-04 blank line stays")
+    check(f"REQ-WIDGET-04 vazhi not called for a blank line ({shell})", not called)
+
+# bash only: a command spanning lines in history is one entry, its number stripped.
+called, args = run("bash", "ls", 0, "list\x07", "ls", "REQ-WIDGET-02 multi-line history",
+                   history=["echo 'two\nlines'"])
 system = args[3].decode() if len(args) > 3 else ""
-# The latest command too: inside bind -x, fc -l would leave it out.
-check("REQ-WIDGET-02 history reaches sol, latest included, numbers stripped",
-      "\n  true first-command\n  echo 'two lines'\n  true latest-command" in system, system)
-
-# REQ-WIDGET-02: a command with non-ASCII text still leaves the cursor at its end.
-run("echo h\u00e9llo", 0, "say hello\x07", "echo h\u00e9llo", "REQ-WIDGET-02 cursor at the end of a UTF-8 command")
-
-# REQ-WIDGET-02: the widget sends the shell's aliases, so an aliased ls runs as the original.
-run("ls -lt", 0, "list newest\x07", "command ls -lt", "REQ-WIDGET-02 aliases reach sol", history=["alias ls='echo'"])
-
-# REQ-WIDGET-03: when no model answers, the request stays on the line unchanged.
-run("", 1, "list files by size\x07", "list files by size", "REQ-WIDGET-03 failure leaves the line")
-
-# REQ-WIDGET-04: Ctrl+G on a blank line asks nothing.
-called, _ = run("ls", 0, "   \x07", "", "REQ-WIDGET-04 blank line stays")
-check("REQ-WIDGET-04 vazhi not called for a blank line", not called)
+check("REQ-WIDGET-02 multi-line history entry joined (bash)", "\n  echo 'two lines'" in system, system)
 
 if failures:
     print(f"ERROR {failures} widget test(s) failed; see the FAIL lines above")

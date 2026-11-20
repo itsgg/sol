@@ -9,7 +9,8 @@ HISTORY_LINES=5
 usage() {
     cat <<'EOF'
 usage: sol [--] REQUEST...      print one command line for REQUEST
-       sol --init bash          print the Ctrl+G widget: eval "$(sol --init bash)" in ~/.bashrc
+       sol --init bash|zsh      print the Ctrl+G widget: eval "$(sol --init bash)" in ~/.bashrc,
+                                or eval "$(sol --init zsh)" in ~/.zshrc
        sol --dry-run REQUEST... print what would be sent to vazhi, and send nothing
        sol --clean              clean a model's answer on standard input to one command line
 
@@ -99,11 +100,13 @@ sol_history() {
 # The names in SOL_ALIASES (`alias` output) that replace a command on PATH, such as ls when it
 # runs eza. Shortcuts like g='git' replace nothing. Only names are used; values never leave.
 sol_alias_names() {
-    local line
+    local line name
     while IFS= read -r line; do
         # Names with only letters, digits, _ and -, so a name is safe inside a regex.
-        [[ $line =~ ^alias\ ([A-Za-z0-9_-]+)= ]] || continue
-        type -P -- "${BASH_REMATCH[1]}" >/dev/null 2>&1 && printf '%s\n' "${BASH_REMATCH[1]}"
+        # bash prints `alias name='value'`, zsh `name=value`.
+        [[ $line =~ ^(alias\ )?([A-Za-z0-9_-]+)= ]] || continue
+        name=${BASH_REMATCH[2]}
+        type -P -- "$name" >/dev/null 2>&1 && printf '%s\n' "$name"
     done <<<"${SOL_ALIASES:-}"
 }
 
@@ -218,22 +221,17 @@ sol_clean() {
 
 sol_init() {
     local self
-    self=$(readlink -f "${BASH_SOURCE[0]}")
+    self=$(printf '%q' "$(readlink -f "${BASH_SOURCE[0]}")")
     case ${1:-} in
-        bash) ;;
-        *)
-            echo "sol: --init takes bash" >&2
-            return 2
-            ;;
-    esac
-    cat <<EOF
+        bash)
+            cat <<EOF
 # sol: type what you want done, press Ctrl+G, and the line becomes the command.
 # Nothing runs until you press Enter. In ~/.bashrc: eval "\$(sol --init bash)"
 __sol_widget() {
     local request=\$READLINE_LINE command
     [[ -n \${request//[[:space:]]/} ]] || return 0
     # history, not fc: inside bind -x, fc -l leaves out the latest command.
-    command=\$(SOL_ALIASES="\$(alias)" SOL_HISTORY="\$(HISTTIMEFORMAT= history $HISTORY_LINES)" SOL_CWD="\$PWD" SOL_SHELL="bash \${BASH_VERSION%%[^0-9.]*}" $(printf '%q' "$self") -- "\$request") || return 0
+    command=\$(SOL_ALIASES="\$(alias)" SOL_HISTORY="\$(HISTTIMEFORMAT= history $HISTORY_LINES)" SOL_CWD="\$PWD" SOL_SHELL="bash \${BASH_VERSION%%[^0-9.]*}" $self -- "\$request") || return 0
     [[ -n \$command ]] || return 0
     READLINE_LINE=\$command
     # bash 5 counts READLINE_POINT in characters, as \${#} does in a UTF-8 locale.
@@ -241,9 +239,42 @@ __sol_widget() {
 }
 bind -x '"\C-g": __sol_widget'
 EOF
+            ;;
+        zsh)
+            cat <<EOF
+# sol: type what you want done, press Ctrl+G, and the line becomes the command.
+# Nothing runs until you press Enter. In ~/.zshrc: eval "\$(sol --init zsh)"
+__sol_widget() {
+    local request=\$BUFFER command
+    [[ -n \${request//[[:space:]]/} ]] || return 0
+    command=\$(SOL_ALIASES="\$(alias)" SOL_HISTORY="\$(fc -ln -$HISTORY_LINES 2>/dev/null)" SOL_CWD="\$PWD" SOL_SHELL="zsh \$ZSH_VERSION" $self -- "\$request")
+    if [[ \$? -ne 0 || -z \$command ]]; then
+        # sol wrote why below the line; draw the prompt again under it.
+        zle reset-prompt
+        return 0
+    fi
+    BUFFER=\$command
+    CURSOR=\${#BUFFER}
+}
+zle -N __sol_widget
+bindkey '^G' __sol_widget
+EOF
+            ;;
+        *)
+            echo "sol: --init takes bash or zsh" >&2
+            return 2
+            ;;
+    esac
 }
 
 main() {
+    # bash 4 has the case conversion and arrays sol uses; macOS ships 3.2 as /bin/bash.
+    # SOL_TEST_BASH_MAJOR stands in for the running version in tests.
+    local major=${SOL_TEST_BASH_MAJOR:-${BASH_VERSINFO[0]}}
+    if ((major < 4)); then
+        echo "sol: needs bash 4 or later to run; this is bash $major (on macOS: brew install bash)" >&2
+        return 2
+    fi
     case ${1:-} in
         -h | --help)
             usage

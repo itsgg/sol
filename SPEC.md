@@ -10,9 +10,9 @@ This spec fixes the interfaces between the widget, the `sol` command and vazhi, 
 
 ## 2. Scope and non-goals
 
-Covered: the first release of SEED section 9: bash only, one command per request, context of system, shell, directory and the last five commands.
+Covered: the first release of SEED section 9 and SEED D5: bash and zsh widgets, one command per request, context of system, shell, directory and the last five commands.
 
-Out: zsh and fish widgets, multi-line scripts, explanations, a confirmation step, offline answers, and any direct call to a model provider (SEED P4). No code may run the command it produces (SEED P1).
+Out: a fish widget, multi-line scripts, explanations, a confirmation step, offline answers, and any direct call to a model provider (SEED P4). No code may run the command it produces (SEED P1).
 
 ## 3. Terms
 
@@ -28,7 +28,7 @@ Two parts, in one bash script, `sol`:
 - The command `sol`: builds the context, calls `vazhi ask --fast`, cleans the answer, prints the command.
 - The widget: bash code that `sol --init bash` prints and `~/.bashrc` evaluates. It reads the line and history, calls `sol` by the absolute path it was printed from, and writes the line back.
 
-Dependencies: bash 5 (READLINE_LINE and READLINE_POINT for `bind -x`, SEED R6), coreutils' `readlink`, and `vazhi` 0.2 or later (`vazhi ask --fast --system TEXT -- PROMPT`, SEED R3). Tests also need python 3 for the pty test and shellcheck. Nothing else.
+Dependencies: bash 4 or later to run `sol`, bash 5 for its widget (READLINE_LINE and READLINE_POINT for `bind -x`, SEED R6), zsh 5 for the zsh widget (ZLE's BUFFER and CURSOR), coreutils' `readlink`, and `vazhi` 0.2 or later (`vazhi ask --fast --system TEXT -- PROMPT`, SEED R3). Tests also need python 3 for the pty test, zsh, and shellcheck; CI installs zsh in `tools/ci-setup.local.sh`. Nothing else.
 
 ## 5. Data model and invariants
 
@@ -60,8 +60,12 @@ Acceptance: `tests/acceptance/sol.sh` (REQ-CMD-01): a request starting with `--`
 When the command has a command word, at its start or after `|`, `;`, `&`, `(` or a backtick, that names an alias in SOL_ALIASES which replaces a command on PATH, the system shall print that word as `command <name>`; it shall send no alias value to vazhi.
 Acceptance: every line of `spec/cases/unalias/cases.tsv` (answer, then expected command, tab-separated) with aliases ls (replacing a command) and g (not), and the prompt holds no alias value (`tests/acceptance/sol.sh`, REQ-CMD-05).
 
+### REQ-CMD-06: Old bash refused
+If `sol` runs under bash older than 4, then it shall print `sol: needs bash 4 or later to run; this is bash <N> (on macOS: brew install bash)` to stderr and exit 2.
+Acceptance: `tests/acceptance/sol.sh` (REQ-CMD-06), with SOL_TEST_BASH_MAJOR standing in for the version.
+
 ### REQ-CMD-02: Bad usage
-If `sol` gets no request, a blank request, or `--init` with anything but `bash`, then it shall print usage to stderr and exit 2.
+If `sol` gets no request, a blank request, or `--init` with anything but `bash` or `zsh`, then it shall print usage to stderr and exit 2.
 Acceptance: `tests/acceptance/sol.sh` (REQ-CMD-02).
 
 ### REQ-CMD-03: No answer
@@ -102,6 +106,10 @@ Acceptance: `tests/acceptance/sol.sh` (REQ-WIDGET-01).
 While bash is reading a line, when Ctrl+G is pressed on a non-blank line, the widget shall call `sol` with the line, `alias` output, `history 5` output (HISTTIMEFORMAT empty), `$PWD` and the bash version, and on exit 0 set READLINE_LINE to the command and READLINE_POINT to its end, running nothing.
 Acceptance: `tests/acceptance/widget.py` (REQ-WIDGET-02) in an interactive bash on a pty: the line becomes the command, typing continues at its end, and the latest command before it reaches `sol`, and an alias defined in the shell makes `ls` come back as `command ls`.
 
+### REQ-WIDGET-05: The zsh widget
+While zsh's line editor is active, when Ctrl+G is pressed on a non-blank line, the widget that `sol --init zsh` prints shall call `sol` with the line, `alias` output, `fc -ln -5` output, `$PWD` and the zsh version, and on exit 0 set BUFFER to the command and CURSOR to its end, running nothing; on failure it shall leave BUFFER as it was and redraw the prompt. REQ-WIDGET-03 and REQ-WIDGET-04 hold for it as for bash.
+Acceptance: `tests/acceptance/widget.py` (REQ-WIDGET-05) runs the widget cases in an interactive zsh on a pty as well as in bash.
+
 ### REQ-WIDGET-03: Failure keeps the line
 If `sol` exits non-zero or prints nothing, then the widget shall leave READLINE_LINE and READLINE_POINT as they were.
 Acceptance: `tests/acceptance/widget.py` (REQ-WIDGET-03).
@@ -116,7 +124,7 @@ Acceptance: `tests/acceptance/widget.py` (REQ-WIDGET-04).
 sol [--] REQUEST...        print one command
 sol --dry-run REQUEST...   print the prompt and request, call nothing
 sol --clean                clean stdin to one command
-sol --init bash            print the widget
+sol --init bash|zsh        print the widget
 sol --help | --version
 ```
 
@@ -146,13 +154,14 @@ Beyond `tools/protected.txt` (which covers `tests/acceptance/**` and `spec/cases
 
 ## 12. Open questions
 
-- O1 (SEED): zsh and fish. Default: bash only. Owner GG. Next action: none until another shell is in use.
+- O1 (SEED): fish. Default: bash and zsh only. Owner GG. Next action: none until someone asks.
 
 ## 13. Changes and retired requirements
 
 - 2026-11-20: created.
 - 2026-11-20: change 0001 merged: REQ-CLEAN-01 keeps backticks inside a line.
 - 2026-11-20: change 0002 merged: REQ-CMD-05 and REQ-CTX-03 added, REQ-WIDGET-02 sends aliases.
+- 2026-11-20: change 0003 merged: REQ-WIDGET-05 (zsh) and REQ-CMD-06 (bash 4) added, REQ-CMD-02 takes zsh.
 
 ### Retired
 

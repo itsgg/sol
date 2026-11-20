@@ -59,9 +59,18 @@ fi
 s1=$?
 "$sol" -- "   " >/dev/null 2>&1
 s2=$?
-"$sol" --init zsh >/dev/null 2>&1
+"$sol" --init fish >/dev/null 2>&1
 s3=$?
 if [[ $s1 -eq 2 && $s2 -eq 2 && $s3 -eq 2 ]]; then pass "REQ-CMD-02 usage errors exit 2"; else fail "REQ-CMD-02 got $s1 $s2 $s3"; fi
+
+# REQ-CMD-06: an old bash is refused with a message that says what to install.
+out=$(SOL_TEST_BASH_MAJOR=3 "$sol" -- list files 2>"$work/err")
+status=$?
+if [[ $status -eq 2 && -z $out ]] && grep -q "needs bash 4 or later" "$work/err"; then
+    pass "REQ-CMD-06 bash 3 refused"
+else
+    fail "REQ-CMD-06 status=$status err=[$(cat "$work/err")]"
+fi
 
 # REQ-CMD-03: vazhi failing exits 1 with nothing on stdout and vazhi's reason on stderr.
 out=$(STUB_STATUS=1 STUB_STDERR="vazhi: every model failed" "$sol" -- list files 2>"$work/err")
